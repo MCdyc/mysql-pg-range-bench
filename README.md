@@ -22,89 +22,63 @@ WHERE event_time >= :lower_bound AND event_time < :upper_bound;
 
 完整字段、数据分布和公平测试规范见 [BENCHMARK.md](BENCHMARK.md)。
 
-## Linux 已有数据库一键隔离测试
+## Linux 项目本地一键测试
 
-如果 Linux 上已经运行 MySQL 和 PostgreSQL，可直接使用隔离入口。它为本次运行生成两个唯一临时数据库，测试结束、失败或收到常规终止信号后，按精确名称删除并验证不再存在；不会新增用户、修改配置、重启服务或接触已有业务库。
+空白 Linux 主机先执行自动安装（支持 Ubuntu、Debian、Fedora、RHEL、CentOS、Rocky Linux 和 AlmaLinux）：
 
 ```bash
-export MYSQL_ADMIN_URL='mysql://管理员:URL编码密码@127.0.0.1:3306/mysql'
-export POSTGRES_ADMIN_URL='postgres://管理员:URL编码密码@127.0.0.1:5432/postgres'
+bash scripts/linux/install.sh
+```
 
-# 先跑 10 万行 / 查询 2 万行
+它按需安装 Docker Engine、Docker Compose v2、Rust stable 和编译工具，并下载固定版本的 MySQL/PostgreSQL 镜像；不会向整机安装 MySQL/PostgreSQL 软件包。安装并立即进行冒烟测试可执行 `bash scripts/linux/install.sh --smoke`。
+
+默认测试入口不会读取整机数据库连接，而是在项目目录下启动或复用两套隔离实例：
+
+```text
+.local-db/data/mysql
+.local-db/data/postgres
+```
+
+先做 10 万行 / 查询 2 万行的冒烟测试：
+
+```bash
 bash scripts/linux/run-one-click.sh --smoke
+```
 
-# 正式默认 3000 万行 / 查询 500 万行
+正式默认 3000 万行 / 查询 500 万行：
+
+```bash
 bash scripts/linux/run-one-click.sh
 ```
 
-基准 JSON 和清理回执会保留在 `benchmark-results/`。只有两个临时库均删除并经系统目录验证后，程序才以成功状态退出。完整权限要求、信号处理、异常恢复和“只能恢复逻辑对象，不能回滚 WAL/redo、日志与缓存”的边界见 [LINUX_ONE_CLICK.md](LINUX_ONE_CLICK.md)。
+每次测试完成或发生可捕获失败后，只删除本工具的随机测试数据库、表和索引，并验证数量为零；MySQL/PostgreSQL 实例和随机本地凭据继续保留，下次直接复用。JSON 结果与清理回执保留在 `benchmark-results/`。
 
-## Docker Linux 快速开始
-
-前置条件：64 位 Linux、Rust stable、Docker Engine 与 Docker Compose v2。3000 万行会占用较多磁盘和数据库日志空间，正式运行前请确认有充足余量。
+完全结束、不再需要实例时才执行：
 
 ```bash
-cp .env.example .env
-bash scripts/db-up.sh both
-cargo build --release --locked
+bash scripts/linux/delete-local-instances.sh
 ```
 
-同一个 Docker daemon 上若有多份本仓库副本，请为每份 `.env` 设置不同的 `COMPOSE_PROJECT_NAME`；重置脚本按该项目名删除两个测试卷。
+该命令只停止当前项目的 Compose 容器，并删除 `.local-db/` 下的实例数据与凭据，不操作整机安装的数据库。完整生命周期、端口和异常恢复说明见 [LINUX_ONE_CLICK.md](LINUX_ONE_CLICK.md)。
 
-程序会从当前目录自动读取 `.env`；模板中的 `MYSQL_URL` / `POSTGRES_URL` 已与 Compose 默认账户对应。若修改账户、密码或端口，也要同步修改这两个 URL（凭据中的 URL 特殊字符需百分号编码）。也可以用当前 shell 临时覆盖：
-
-```bash
-export MYSQL_URL='mysql://benchmark:benchmark_password@127.0.0.1:3306/benchmark'
-export POSTGRES_URL='postgres://benchmark:benchmark_password@127.0.0.1:5432/benchmark'
-```
-
-先做小规模冒烟测试；具体参数以 `--help` 输出为准：
-
-```bash
-./target/release/mysql-pg-range-bench \
-  --database both \
-  --rows 100000 \
-  --scan-rows 20000 \
-  --output benchmark-results/smoke.json
-```
-
-确认成功后，可以用便捷双库模式完整跑一遍；它会让两个服务同时常驻，适合功能验证，不作为严格的正式性能排名：
-
-```bash
-./target/release/mysql-pg-range-bench \
-  --database both \
-  --rows 30000000 \
-  --scan-rows 5000000 \
-  --batch-size 1000 \
-  --transaction-rows 100000 \
-  --warmups 2 \
-  --runs 5 \
-  --output benchmark-results/run-01.json
-```
-
-程序会重建专用表 `benchmark_events`，随后依次记录建表、插入、统计信息维护、预热和多轮查询。插入时间是 Rust 客户端观察到的端到端时间，包含确定性流式生成、指纹计算、网络发送和事务提交；两库采用完全相同口径。不要把它指向含有同名业务表的数据库。
+如确实需要连接已有整机数据库，必须显式使用 `scripts/linux/run-existing-one-click.sh`；其边界见 [LINUX_EXISTING_DATABASES.md](LINUX_EXISTING_DATABASES.md)。
 
 ## 建议的正式测试方式
 
 1. 固定 CPU、内存、磁盘、镜像版本和数据库配置，不要在测试期间运行其他重负载。
-2. 先重置数据卷，再测试一种数据库；下一轮交换测试顺序，避免顺序偏差。
+2. 先运行冒烟测试；正式运行时保持两套本地实例的资源限制一致。
 3. 插入吞吐与查询耗时分开比较；`VACUUM (ANALYZE)` / `ANALYZE TABLE` 也单独记录。
-4. 热缓存结果至少运行 5 轮并报告中位数和 p95。冷缓存需要重启数据库并按 `BENCHMARK.md` 的流程单独测试。
+4. 热缓存结果至少运行 5 轮并报告中位数和 p95。冷缓存需要按 `BENCHMARK.md` 的流程单独测试。
 5. 分享结果时同时提供生成的 JSON、`uname -a`、`lscpu`、`free -h`、磁盘型号/挂载方式和容器版本。
 
-一次只运行一个数据库的正式轮次可直接使用默认规模：
+需要从完全空白实例重新开始时：
 
 ```bash
-bash scripts/db-reset.sh --yes mysql
-./target/release/mysql-pg-range-bench \
-  --database mysql --output benchmark-results/mysql-01.json
-
-bash scripts/db-reset.sh --yes postgres
-./target/release/mysql-pg-range-bench \
-  --database postgres --output benchmark-results/postgres-01.json
+bash scripts/linux/delete-local-instances.sh --yes
+bash scripts/linux/run-one-click.sh --smoke
 ```
 
-第二次重置会删除两边的数据库卷，但不会删除宿主机上的 JSON 结果。
+删除实例不会删除宿主机上的 JSON 结果。
 
 可在正式运行前后采集这些信息。脚本不输出数据库连接密码，也只采集本 Compose 项目的容器资源快照；但系统报告仍包含主机名、设备、挂载路径和源码文件名，外发前请按环境要求脱敏：
 
@@ -113,13 +87,13 @@ mkdir -p benchmark-results
 bash scripts/system-info.sh > benchmark-results/system-info.txt
 ```
 
-如需清空两个测试数据库并重建：
+如需完全删除两个项目本地实例并重建：
 
 ```bash
 bash scripts/db-reset.sh
 ```
 
-该脚本会先询问确认；`bash scripts/db-reset.sh --yes mysql` 会直接删除本项目的两个 Docker 数据卷，并且只启动 MySQL。正式测试建议一次只启动一个数据库：`bash scripts/db-up.sh mysql` 或 `bash scripts/db-up.sh postgres`，脚本会停止另一服务。
+该脚本会先询问确认；`bash scripts/db-reset.sh --yes mysql` 会删除本项目目录下的两套实例数据，然后只重新启动 MySQL。`bash scripts/db-up.sh mysql|postgres|both` 可手动启动或复用指定实例。
 
 ## Windows 本机实例
 

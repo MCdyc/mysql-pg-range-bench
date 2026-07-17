@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+set +x
+set -Eeuo pipefail
+umask 077
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=linux/local-instance-lib.sh
+source "${SCRIPT_DIR}/linux/local-instance-lib.sh"
+local_initialize
+cd -- "${LOCAL_PROJECT_ROOT}"
 
 section() {
   printf '\n## %s\n' "$1"
@@ -50,9 +57,9 @@ docker compose version
 docker info --format 'DockerRootDir={{.DockerRootDir}} Driver={{.Driver}} CgroupVersion={{.CgroupVersion}} CgroupDriver={{.CgroupDriver}}'
 
 section "compose_images"
-docker compose images
+local_compose images
 
-image_list="$(docker compose config --images)"
+image_list="$(local_compose config --images)"
 mapfile -t image_names < <(printf '%s\n' "$image_list" | sed '/^$/d' | sort -u)
 for image_name in "${image_names[@]}"; do
   if docker image inspect "$image_name" >/dev/null 2>&1; then
@@ -65,7 +72,7 @@ for image_name in "${image_names[@]}"; do
 done
 
 section "container_limits"
-container_list="$(docker compose ps --all --quiet)"
+container_list="$(local_compose ps --all --quiet)"
 mapfile -t container_ids < <(printf '%s\n' "$container_list" | sed '/^$/d')
 for container_id in "${container_ids[@]}"; do
   docker inspect --format \
@@ -74,11 +81,11 @@ for container_id in "${container_ids[@]}"; do
 done
 
 section "database_versions"
-if docker compose ps --status running --services | grep -qx mysql; then
-  docker compose exec --no-TTY mysql mysqld --version
+if local_compose ps --status running --services | grep -qx mysql; then
+  local_compose exec --no-TTY mysql mysqld --version
 fi
-if docker compose ps --status running --services | grep -qx postgres; then
-  docker compose exec --no-TTY postgres postgres --version
+if local_compose ps --status running --services | grep -qx postgres; then
+  local_compose exec --no-TTY postgres postgres --version
 fi
 
 section "container_snapshot"
