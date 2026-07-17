@@ -1,0 +1,87 @@
+name: ${COMPOSE_PROJECT_NAME:-db-range-benchmark}
+
+x-database-common: &database-common
+  restart: "no"
+  cpus: ${DB_CPU_LIMIT:-4.0}
+  mem_limit: ${DB_MEMORY_LIMIT:-4g}
+  memswap_limit: ${DB_MEMORY_SWAP_LIMIT:-4g}
+  pids_limit: 4096
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  logging:
+    driver: local
+    options:
+      max-size: 20m
+      max-file: "3"
+
+services:
+  mysql:
+    <<: *database-common
+    image: ${MYSQL_IMAGE:-mysql:8.4.8}
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-benchmark}
+      MYSQL_USER: ${DB_USER:-benchmark}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-benchmark_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password}
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --max-allowed-packet=64M
+      - --innodb-flush-log-at-trx-commit=1
+      - --skip-log-bin
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping --host=127.0.0.1 --user=root --password="$${MYSQL_ROOT_PASSWORD}" --silent
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    stop_grace_period: 1m
+
+  postgres:
+    <<: *database-common
+    image: ${POSTGRES_IMAGE:-postgres:17.10}
+    environment:
+      POSTGRES_DB: ${DB_NAME:-benchmark}
+      POSTGRES_USER: ${DB_USER:-benchmark}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-benchmark_password}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - -c
+      - timezone=UTC
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    shm_size: ${POSTGRES_SHM_SIZE:-1g}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --host=127.0.0.1 --username="$${POSTGRES_USER}" --dbname="$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    stop_grace_period: 1m
+
+volumes:
+  mysql-data:
+  postgres-data:

@@ -1,0 +1,9 @@
+.env
+.env.linux
+.env.linux.local
+target/
+*.log
+*.csv
+*.tsv
+benchmark-results/
+.DS_Store
