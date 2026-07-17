@@ -206,7 +206,14 @@ runs    = 5   # 记录到 measured_ms，并生成汇总
 
 ## 7. Linux 运行示例
 
-构建 release 版本：
+推荐使用项目本地实例入口，它会自动管理连接、清理测试数据并保留实例复用：
+
+```bash
+bash scripts/linux/run-one-click.sh --smoke
+bash scripts/linux/run-one-click.sh
+```
+
+下面是自行提供数据库连接时的底层用法。构建 release 版本：
 
 ```bash
 cargo build --release --locked
@@ -215,8 +222,8 @@ cargo build --release --locked
 程序会自动读取当前目录的 `.env`。也可以在 shell 中覆盖连接地址后运行默认正式规模：
 
 ```bash
-export MYSQL_URL='mysql://benchmark:benchmark_password@127.0.0.1:3306/benchmark'
-export POSTGRES_URL='postgres://benchmark:benchmark_password@127.0.0.1:5432/benchmark'
+export MYSQL_URL='mysql://用户:URL编码密码@127.0.0.1:3306/benchmark'
+export POSTGRES_URL='postgres://用户:URL编码密码@127.0.0.1:5432/benchmark'
 
 ./target/release/mysql-pg-range-bench \
   --database both \

@@ -23,8 +23,11 @@ services:
     environment:
       MYSQL_DATABASE: ${DB_NAME:-benchmark}
       MYSQL_USER: ${DB_USER:-benchmark}
-      MYSQL_PASSWORD: ${DB_PASSWORD:-benchmark_password}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?use the project local-instance scripts}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?use the project local-instance scripts}
+      # Required for the Rust host client. The published port remains bound
+      # exclusively to 127.0.0.1 and the password is random/project-local.
+      MYSQL_ROOT_HOST: "%"
       TZ: UTC
     command:
       - --character-set-server=utf8mb4
@@ -34,9 +37,9 @@ services:
       - --innodb-flush-log-at-trx-commit=1
       - --skip-log-bin
     ports:
-      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+      - "127.0.0.1:${MYSQL_PORT:-13306}:3306"
     volumes:
-      - mysql-data:/var/lib/mysql
+      - "${LOCAL_DB_ROOT:-./.local-db/data}/mysql:/var/lib/mysql"
     healthcheck:
       test:
         - CMD-SHELL
@@ -53,7 +56,7 @@ services:
     environment:
       POSTGRES_DB: ${DB_NAME:-benchmark}
       POSTGRES_USER: ${DB_USER:-benchmark}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-benchmark_password}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?use the project local-instance scripts}
       POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
       TZ: UTC
       PGTZ: UTC
@@ -68,10 +71,10 @@ services:
       - -c
       - full_page_writes=on
     ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
     shm_size: ${POSTGRES_SHM_SIZE:-1g}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - "${LOCAL_DB_ROOT:-./.local-db/data}/postgres:/var/lib/postgresql/data"
     healthcheck:
       test:
         - CMD-SHELL
@@ -81,7 +84,3 @@ services:
       retries: 30
       start_period: 15s
     stop_grace_period: 1m
-
-volumes:
-  mysql-data:
-  postgres-data:

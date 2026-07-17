@@ -1,31 +1,31 @@
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
-
-if ! docker compose version >/dev/null 2>&1; then
-  echo "Docker Compose v2 is required (the 'docker compose' command)." >&2
-  exit 1
-fi
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 
 assume_yes=false
 target=both
 for arg in "$@"; do
-  case "$arg" in
-    --yes) assume_yes=true ;;
-    mysql|postgres|both) target="$arg" ;;
-    *)
-      echo "Usage: $0 [--yes] [mysql|postgres|both]" >&2
-      exit 2
-      ;;
-  esac
+    case "${arg}" in
+        --yes)
+            assume_yes=true
+            ;;
+        mysql|postgres|both)
+            target="${arg}"
+            ;;
+        *)
+            printf 'Usage: %s [--yes] [mysql|postgres|both]\n' "$0" >&2
+            exit 2
+            ;;
+    esac
 done
 
-if [[ "$assume_yes" != true ]]; then
-  echo "This deletes both benchmark data volumes, then starts: $target."
-  read -r -p "Continue? [y/N] " answer
-  [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 0
+delete_args=()
+if [[ "${assume_yes}" == true ]]; then
+    delete_args+=(--yes)
 fi
 
-docker compose down --volumes --remove-orphans
-bash scripts/db-up.sh "$target"
+bash "${PROJECT_ROOT}/scripts/linux/delete-local-instances.sh" "${delete_args[@]}"
+bash "${PROJECT_ROOT}/scripts/db-up.sh" "${target}"

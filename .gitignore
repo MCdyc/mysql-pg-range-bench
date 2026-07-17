@@ -1,6 +1,7 @@
 .env
 .env.linux
 .env.linux.local
+.local-db/
 target/
 *.log
 *.csv

@@ -1,89 +1,115 @@
-# Linux 现有数据库一键隔离测试
+# Linux 项目本地可复用数据库
 
-该入口用于已经安装并运行 MySQL、PostgreSQL 的 Linux 主机。它在两个服务器上各创建一个本次运行专用的随机临时数据库，调用 Rust 基准程序，随后删除临时数据库并查询系统目录确认不存在。
+默认 Linux 入口不连接机器上已经安装或运行的 MySQL、PostgreSQL。它通过 Docker Compose 创建两套只属于当前项目目录的实例：
 
-它不会创建或删除数据库用户，不修改全局配置，不重启服务，不清理缓存，也不会接触用户指定的业务数据库。
-
-## 前置条件
-
-- 64 位 Linux；
-- Rust stable 和 Cargo；
-- MySQL、PostgreSQL 已经运行，磁盘空间足够；
-- 两个连接账号分别能创建/删除本工具的临时库，并能在其中执行建表、建索引、`INSERT`、`SELECT` 和 `ANALYZE`；建议使用专用最小权限账号，MySQL 可按 `codex_range_bench_` 数据库前缀限制库级权限；
-- PostgreSQL 管理员还需能够终止本次临时数据库的连接。
-
-管理员 URL 必须指向原本就存在的维护数据库，例如：
-
-```bash
-export MYSQL_ADMIN_URL='mysql://bench_admin:URL编码后的密码@127.0.0.1:3306/mysql'
-export POSTGRES_ADMIN_URL='postgres://bench_admin:URL编码后的密码@127.0.0.1:5432/postgres'
+```text
+.local-db/
+├── credentials.env
+├── data/
+│   ├── mysql/
+│   └── postgres/
+└── instance.lock
 ```
 
-凭据中的 `@`、`:`、`/`、`#`、`%` 等字符必须进行 URL 百分号编码。不要把真实管理员 URL 写进 Git、命令参数或结果文件；建议通过现有 secret manager 注入环境变量，并以专用操作系统账号运行。
+`.local-db/` 已被 Git 忽略。数据库文件和随机生成的本地凭据会跨测试保留，因此第二次运行可以直接复用实例，不需要重新初始化。
 
-## 一键运行
+## 空白主机自动安装
 
-先做 10 万行冒烟测试：
+在已克隆的项目目录内，以普通登录用户执行（不要在命令前加 `sudo`，脚本会在安装系统组件时自行申请权限）：
+
+```bash
+bash scripts/linux/install.sh
+```
+
+该脚本支持 Ubuntu、Debian、Fedora、RHEL、CentOS、Rocky Linux 和 AlmaLinux，会按需安装编译工具、Docker Engine、Docker Compose v2、Rust stable，并自动下载固定版本的 `mysql:8.4.8` 与 `postgres:17.10` 镜像。已经存在的组件和镜像会直接复用。
+
+安装并立即执行冒烟测试可合并为一条命令：
+
+```bash
+bash scripts/linux/install.sh --smoke
+```
+
+使用 `--run` 则会安装后立即执行正式 3000 万行测试。MySQL/PostgreSQL 不会作为整机软件包安装；Docker 镜像存放在 Docker 自身缓存中，实际数据库数据只写入项目的 `.local-db/data/`。
+
+自动安装会给 Linux 增加 Docker、Rust 和编译工具，但不会安装或修改整机 MySQL/PostgreSQL。`delete-local-instances.sh` 只负责删除本项目数据库实例，不会卸载这些通用开发依赖。
+
+## 已安装环境的前置条件
+
+- 64 位 Linux；
+- Rust stable 与 Cargo；
+- Docker Engine；
+- 支持 `docker compose up --wait` 的 Docker Compose v2；
+- 当前用户能够访问 Docker daemon；
+- 正式 3000 万行测试所需的充足磁盘空间。
+
+默认只监听回环地址：
+
+- MySQL：`127.0.0.1:13306`
+- PostgreSQL：`127.0.0.1:15432`
+
+需要改端口时使用 `LOCAL_MYSQL_PORT`、`LOCAL_POSTGRES_PORT`。默认入口拒绝管理员 URL 参数，并覆盖可能存在的数据库连接环境变量，因此不会误连整机数据库。
+
+## 一键测试与复用
+
+第一次先做冒烟测试：
 
 ```bash
 bash scripts/linux/run-one-click.sh --smoke
 ```
 
-正式默认规模为写入 30,000,000 行、范围计数 5,000,000 行：
+正式规模：
 
 ```bash
 bash scripts/linux/run-one-click.sh
 ```
 
-也可以显式覆盖非凭据参数：
+每次执行固定遵循以下生命周期：
+
+1. 对当前项目目录加文件锁，禁止同一实例并发测试或删除。
+2. 检查固定版本的 MySQL、PostgreSQL 镜像；缺失时自动下载。
+3. 启动或复用 `.local-db/data/` 中的 MySQL、PostgreSQL。
+4. 测试前清理上一次不可捕获中断可能遗留的 `codex_range_bench_<UUID>` 数据库。
+5. Rust 程序在两边创建本次专用随机数据库，写入相同数据并执行范围查询。
+6. 正常、失败、`Ctrl+C`、`SIGTERM` 或 `SIGHUP` 后，Rust 按精确名称删除本次测试数据库。
+7. 外层脚本再次只在这两套项目本地实例内枚举合法 UUID 名，删除遗留项并查询系统目录验证数量为零。
+8. 保留 MySQL/PostgreSQL 实例、随机凭据和空的维护数据库，供下次测试复用。
+
+测试结果与清理回执保留在 `benchmark-results/`，数据库表、索引和测试数据库不会保留。
+
+## 完全删除本地实例
+
+确认不再需要复用时执行：
 
 ```bash
-bash scripts/linux/run-one-click.sh \
-  --rows 1000000 \
-  --scan-rows 166667 \
-  --runs 10 \
-  --output benchmark-results/linux-1m.json
+bash scripts/linux/delete-local-instances.sh
 ```
 
-脚本会以 `--locked --release` 构建两个 Rust 可执行文件。管理员 URL 只从环境读取，不会放到子进程命令行或 JSON 中。基准子进程必须通过环境获得指向临时库的 URL；Linux 上同一用户或 root 理论上可以读取进程环境，因此不要在不可信的共享账号下运行。
+无人值守方式：
 
-## 生命周期和删除范围
+```bash
+bash scripts/linux/delete-local-instances.sh --yes
+```
 
-每次运行执行以下固定流程：
+删除脚本会先取得同一项目锁，随后：
 
-1. 验证两个管理员连接，但不更改服务器配置。
-2. 由程序内部生成带随机后缀的 MySQL、PostgreSQL 临时数据库名。
-3. 分别查询系统目录，确认同名数据库原本不存在。
-4. 每次发出 `CREATE DATABASE` 前，先把该精确随机名的清理授权原子写入回执；收到成功响应后再记录为已创建。这样即使服务端已创建、客户端却丢失响应，也能清理。
-5. 只把临时数据库 URL 传给基准子进程。
-6. 基准完成、失败或收到 `Ctrl+C`、`SIGTERM`、`SIGHUP` 后，分别尝试清理两边；一个清理失败不会阻止另一个。
-7. PostgreSQL 先禁止本次精确临时库的新连接，再只终止连接到该库的会话；不依赖 PostgreSQL 13 才有的 `DROP ... WITH (FORCE)`。
-8. 按本次精确名称执行 `DROP DATABASE`，不做前缀、通配符或批量删除。
-9. 再次查询 MySQL `information_schema.schemata` 和 PostgreSQL `pg_database`，确认两个临时库均不存在。
+1. 停止并删除仅带有当前项目 Compose 标签的容器和网络；
+2. 验证这些容器已经不存在；
+3. 删除 `.local-db/data/mysql`、`.local-db/data/postgres`；
+4. 删除 `.local-db/credentials.env`。
 
-程序不接受用户指定临时数据库名，因而不能被用来让清理逻辑删除某个已有业务库。它只清理本次预检为不存在、且在创建尝试前已持久化授权的精确随机名；若创建只尝试了一边，另一边不会被删除。运行期间不要让其他具有建库权限的进程针对回执中的随机名执行对抗性并发 DDL。
+它不会按镜像名、端口或宽泛前缀删除其他 Docker 容器，也不会操作系统安装的 MySQL/PostgreSQL 数据目录。
+Docker 镜像缓存会保留，可供以后重新创建实例；镜像本身不包含本次数据库数据。
 
-## 结果和清理回执
+## 其他入口
 
-正常运行会保留两个文件：
+- 只启动或复用本地实例：`bash scripts/db-up.sh both`
+- 完全删除后重新创建：`bash scripts/db-reset.sh`
+- 明确连接已有整机数据库的旧模式：`bash scripts/linux/run-existing-one-click.sh`
 
-- 基准 JSON：字段、样例、插入吞吐、查询原始耗时、汇总和执行计划；
-- 清理回执 JSON：本次精确临时库名、各自创建/删除/验证状态、子进程退出状态和清理错误。
+已有整机数据库模式的权限与清理边界见 [LINUX_EXISTING_DATABASES.md](LINUX_EXISTING_DATABASES.md)。
 
-两个路径必须是尚不存在的新文件，并且规范化后不能指向同一位置；默认入口会用 UTC 时间、进程号生成新名称。这项检查在任何建库操作之前完成，避免旧结果或路径别名覆盖恢复回执。
+## 状态边界
 
-清理回执不包含管理员 URL 或密码。只有两个删除验证都成功时，一键程序才以成功状态退出；否则会显著报错并保留精确库名，供管理员进行安全的人工处理。
+每次测试结束会恢复**项目本地实例中的逻辑测试数据状态**：本工具的随机数据库、表和索引为零，但实例本身继续运行和复用。
 
-## “保持原本状态”的边界
-
-该程序保证的是测试结束后的**逻辑对象状态**：不残留本次测试数据库、表、索引或新增用户，也不修改服务器配置和服务状态。
-
-数据库执行过负载后，以下运行历史无法回滚：
-
-- MySQL redo/binlog、PostgreSQL WAL 和数据库日志；
-- buffer pool、shared buffers 与操作系统页缓存；
-- 性能监控计数、连接记录、统计信息和后台任务活动；
-- 数据文件/WAL 文件曾经增长、磁盘写入量和可能的碎片；
-- 测试期间产生的 CPU、I/O、温度和电源状态变化。
-
-`SIGKILL`、内核崩溃、断电或管理员连接永久中断无法被进程捕获，因此任何在线程序都不能承诺此时自动删除。`Ctrl+C`、`SIGTERM`、`SIGHUP` 如果在管理 DDL 正在执行，会在该数据库操作返回后进入清理。编排器会在首次创建前写出精确清理回执，并在每个创建步骤前后原子更新，以便发生不可捕获异常时只处理回执中记录的本次数据库。
+数据库日志、WAL/redo、缓存、性能计数以及数据目录曾经增长的历史不会因删除测试数据库而回滚。只有执行 `delete-local-instances.sh` 才会停止实例并移除完整数据目录。`SIGKILL`、断电或 Docker daemon 永久失联无法在当次自动清理；下一次正常运行会先清理合法前缀的遗留测试数据库。
