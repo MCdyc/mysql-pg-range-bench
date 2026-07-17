@@ -507,6 +507,7 @@ struct DataModelReport {
     fingerprint_algorithm: &'static str,
     schema_status: &'static str,
     sample_rows_source: &'static str,
+    primary_key_column: &'static str,
     indexed_column: &'static str,
     index_created_before_insert: Option<bool>,
     explicit_indexes: Option<u32>,
@@ -747,7 +748,7 @@ async fn main() -> Result<()> {
     }
 
     let report = BenchmarkReport {
-        report_version: 2,
+        report_version: 3,
         started_at_utc: format_utc(started_at.naive_utc()),
         finished_at_utc: format_utc(Utc::now().naive_utc()),
         config: report_config(&config),
@@ -844,7 +845,7 @@ async fn recreate_mysql_schema(pool: &MySqlPool, table: &str) -> Result<()> {
         .context("drop old MySQL benchmark table")?;
     let create_table = format!(
         "CREATE TABLE {table} (\
-         id BIGINT NOT NULL,\
+         id BIGINT NOT NULL PRIMARY KEY,\
          event_time DATETIME(6) NOT NULL,\
          user_id BIGINT NOT NULL,\
          order_id BIGINT NOT NULL,\
@@ -879,7 +880,7 @@ async fn recreate_postgres_schema(pool: &PgPool, table: &str) -> Result<()> {
         .context("drop old PostgreSQL benchmark table")?;
     let create_table = format!(
         "CREATE TABLE {table} (\
-         id BIGINT NOT NULL,\
+         id BIGINT NOT NULL PRIMARY KEY,\
          event_time TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,\
          user_id BIGINT NOT NULL,\
          order_id BIGINT NOT NULL,\
@@ -1726,9 +1727,10 @@ fn data_model_report(config: &ResolvedConfig) -> Result<DataModelReport> {
             "created by this run from the recorded column model"
         },
         sample_rows_source: "deterministic generator; not rows read back from the database",
+        primary_key_column: "id",
         indexed_column: "event_time",
         index_created_before_insert: (!config.skip_insert).then_some(true),
-        explicit_indexes: (!config.skip_insert).then_some(1),
+        explicit_indexes: (!config.skip_insert).then_some(2),
         columns,
         sample_rows,
     })
@@ -1928,13 +1930,14 @@ mod tests {
     }
 
     #[test]
-    fn reported_model_has_fifteen_not_null_columns_and_one_time_index() {
+    fn reported_model_has_fifteen_not_null_columns_id_primary_key_and_time_index() {
         let config = test_config();
         let model = data_model_report(&config).expect("build data-model report");
 
         assert_eq!(model.columns.len(), 15);
         assert!(model.columns.iter().all(|column| !column.nullable));
-        assert_eq!(model.explicit_indexes, Some(1));
+        assert_eq!(model.primary_key_column, "id");
+        assert_eq!(model.explicit_indexes, Some(2));
         assert_eq!(model.indexed_column, "event_time");
         assert_eq!(model.index_created_before_insert, Some(true));
         assert_eq!(model.sample_rows.len(), 3);
