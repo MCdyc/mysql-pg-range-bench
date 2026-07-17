@@ -1,6 +1,6 @@
 # MySQL / PostgreSQL 3000 万行范围查询基准
 
-这是一套面向 Linux 的可复现基准：Rust 生成同一批确定性伪随机数据，分别写入 MySQL 与 PostgreSQL，再对带索引的时间列执行 `COUNT(*)` 范围查询。默认写入 30,000,000 行，查询范围精确覆盖 5,000,000 行。
+这是一套面向 Linux 的可复现基准：Rust 生成同一批确定性伪随机数据，分别写入 MySQL 与 PostgreSQL，再对带索引的时间列执行 `COUNT(*)` 范围查询。默认写入 30,000,000 行，查询范围精确覆盖 5,000,000 行；随后使用两个并发事务验证 `FOR UPDATE SKIP LOCKED`，在 500 行时间范围内锁住前 100 行并要求另一连接精确返回其余 400 行。
 
 > 本仓库提供测试程序和结果采集格式，不包含虚构的性能数字。性能结果必须在目标 Linux 主机上实际运行后生成。
 
@@ -19,6 +19,18 @@ WHERE event_time >= :lower_bound AND event_time < :upper_bound;
 ```
 
 上面用命名符号表示绑定值；程序实际对 MySQL 使用 `?`，对 PostgreSQL 使用 `$1` / `$2`。
+
+普通范围查询计时完成后，程序还会执行独立的行锁测试：
+
+```sql
+SELECT id
+FROM benchmark_events
+WHERE event_time >= :lower_bound AND event_time < :skip_locked_upper_bound
+ORDER BY event_time
+FOR UPDATE SKIP LOCKED;
+```
+
+该测试不使用聚合：连接 A 在 `READ COMMITTED` 事务中锁住候选范围前 100 行，连接 B 对全部 500 行执行上述查询。程序校验候选数为 500、持锁数为 100、返回数为 400、返回 ID 与持锁 ID 不相交，并验证 JSON `EXPLAIN` 实际选择了 `event_time` 索引；两个事务最后均回滚。
 
 完整字段、数据分布和公平测试规范见 [BENCHMARK.md](BENCHMARK.md)。
 
@@ -45,7 +57,7 @@ bash scripts/linux/install.sh
 bash scripts/linux/run-one-click.sh --smoke
 ```
 
-正式默认 3000 万行 / 查询 500 万行：
+正式默认 3000 万行 / 查询 500 万行，并执行 500/100/400 的 `SKIP LOCKED` 校验：
 
 ```bash
 bash scripts/linux/run-one-click.sh

@@ -10,8 +10,9 @@
 2. 流式生成并插入 30,000,000 行确定性数据。
 3. MySQL 执行 `ANALYZE TABLE`；PostgreSQL 执行 `VACUUM (ANALYZE)`。
 4. 对居中的时间范围执行 `COUNT(*)`，结果必须精确等于 5,000,000。
+5. 在主范围开头取 500 行作为候选集；事务 A 锁住前 100 行，事务 B 执行 `FOR UPDATE SKIP LOCKED`，必须通过时间索引精确返回另外 400 行，然后回滚两个事务。
 
-默认是单客户端、单连接、无并发。连接池上限 `--pool-size` 默认为 1；增大该值也不会让当前插入或查询逻辑并行执行。程序为每个 MySQL 连接设置 `time_zone='+00:00'`，为每个 PostgreSQL 连接设置 UTC，并将 PostgreSQL 的 `max_parallel_workers_per_gather` 设为 0。
+插入和 500 万行 `COUNT(*)` 基准是单客户端、单连接、无并发。连接池上限 `--pool-size` 默认为 1；增大该值也不会让这两部分并行执行。`SKIP LOCKED` 是随后运行的独立并发语义测试，为每个数据库临时建立恰好两个专用连接。程序为每个 MySQL 连接设置 `time_zone='+00:00'`，为每个 PostgreSQL 连接设置 UTC，并将 PostgreSQL 的 `max_parallel_workers_per_gather` 设为 0。
 
 `--database both` 会先建立两个数据库连接池，然后按固定顺序完整运行 MySQL，再完整运行 PostgreSQL。每个选中的数据库只重建和插入一次。`--runs` 表示每个数据库的**计时查询次数**，不是插入轮数。若要获得 5 个独立插入样本，必须从外部启动 5 次程序并分别保存结果。
 
@@ -193,16 +194,49 @@ runs    = 5   # 记录到 measured_ms，并生成汇总
 
 `summary_ms` 根据 `measured_ms` 给出 `min`、`max`、`mean`、`median` 和最近秩定义的 `p95`。样本数只有默认的 5 时，p95 实际等于最大值；解释结果时应同时查看原始数组。
 
+### 6.1 `SKIP LOCKED` 并发语义测试
+
+普通范围查询完成后，每个数据库另外执行一次以下测试。它不是在 `COUNT(*)` 后拼接锁子句，因为 PostgreSQL 不允许聚合结果使用行锁；程序实际选择并锁定能够对应到表行的 `id`：
+
+```sql
+SELECT id
+FROM benchmark_events
+WHERE event_time >= :lower AND event_time < :skip_locked_upper
+ORDER BY event_time
+FOR UPDATE SKIP LOCKED;
+```
+
+默认参数为：
+
+```text
+skip_locked_rows      = 500
+skip_locked_held_rows = 100
+expected_returned     = 400
+```
+
+测试使用两个新的 `READ COMMITTED` 连接，避免 MySQL `REPEATABLE READ` 的范围 gap/next-key 锁把候选范围以外的行为混入语义：
+
+1. 先用普通 `COUNT(*)` 验证这个时间子范围精确包含 500 行。
+2. 事务 A 按 `event_time` 排序，以 `FOR UPDATE LIMIT 100` 锁住前 100 行并保持事务打开。
+3. 事务 B 对完整 500 行范围执行 `FOR UPDATE SKIP LOCKED`，Rust 从客户端完整取回 ID 并计时。
+4. 必须精确返回 400 个唯一 ID，且与事务 A 的 100 个 ID 完全不相交。
+5. 非 `ANALYZE` JSON `EXPLAIN` 必须显示实际选择了 `idx_<table>_event_time`；仅出现在 `possible_keys` 中不算通过。
+6. 两个事务都显式 `ROLLBACK`，不修改任何测试数据。
+
+`skip_locked.elapsed_ms` 只覆盖事务 B 发出查询、跳过已锁行并由 Rust 取回全部 ID 的时间；建连接、候选计数、`EXPLAIN`、事务 A 取锁和两个回滚不计入。可用 `--skip-locked-rows`、`--skip-locked-held-rows` 修改规模，但候选数不得超过 `--scan-rows`，持锁数必须大于零且小于候选数。
+
+`SKIP LOCKED` 返回的是有意忽略当前已锁行的不一致视图，适合任务队列等多消费者场景；它不能替代普通一致性范围统计，也不应与前面的 500 万行 `COUNT(*)` 耗时混为同一种查询。
+
 使用 `--database both` 时，一次程序运行的结构是：
 
 ```text
 连接 MySQL 和 PostgreSQL
-  -> MySQL：重建表 -> 插入一次 -> ANALYZE -> EXPLAIN -> 2 次预热 -> 5 次计时
-  -> PostgreSQL：重建表 -> 插入一次 -> VACUUM ANALYZE -> EXPLAIN -> 2 次预热 -> 5 次计时
+  -> MySQL：重建表 -> 插入一次 -> ANALYZE -> 范围计数 -> SKIP LOCKED 校验
+  -> PostgreSQL：重建表 -> 插入一次 -> VACUUM ANALYZE -> 范围计数 -> SKIP LOCKED 校验
   -> 比较两次生成指纹 -> 写一个 JSON 文件
 ```
 
-`--skip-insert` 会跳过删表、建表、建索引和插入，但仍会执行维护、`EXPLAIN`、预热和计时查询。使用它时，现有表必须具有本文的确切 15 列 schema、唯一的显式时间索引，并与本次 `--rows`、`--scan-rows`、`--range-start-row`、`--seed` 和 `--base-time` 相匹配。程序只会通过范围计数发现部分不匹配，不会回读校验全部字段或查询系统目录；因此 JSON 会把 `schema_status` 标为 expected/unverified，并把索引数量及“插入前已创建”状态写为 `null`。
+`--skip-insert` 会跳过删表、建表、建索引和插入，但仍会执行维护、范围查询与 `SKIP LOCKED` 校验。使用它时，现有表必须具有本文的确切 15 列 schema、唯一的显式时间索引，并与本次参数相匹配。程序会通过两个范围计数、`SKIP LOCKED` 返回行和执行计划发现部分不匹配，但不会回读校验全部字段或查询系统目录；因此 JSON 会把 `schema_status` 标为 expected/unverified，并把索引数量及“插入前已创建”状态写为 `null`。
 
 ## 7. Linux 运行示例
 
@@ -229,6 +263,8 @@ export POSTGRES_URL='postgres://用户:URL编码密码@127.0.0.1:5432/benchmark'
   --database both \
   --rows 30000000 \
   --scan-rows 5000000 \
+  --skip-locked-rows 500 \
+  --skip-locked-held-rows 100 \
   --batch-size 1000 \
   --transaction-rows 100000 \
   --warmups 2 \
@@ -314,6 +350,7 @@ PostgreSQL: [ ] [ ] [ ] [ ] [ ]；median=；p95=
 对应 generated_fingerprint：
 schema_setup_ms：
 维护耗时：MySQL ANALYZE TABLE=；PostgreSQL VACUUM ANALYZE=
+SKIP LOCKED：候选/持锁/返回=500/100/400；MySQL 耗时=；PostgreSQL 耗时=；两边 event_time 索引验证=
 
 热查询 measured_ms：MySQL=[ ]；PostgreSQL=[ ]
 热查询汇总：各自 min/mean/median/p95/max=
@@ -334,6 +371,8 @@ schema_setup_ms：
 - 把 `schema_setup_ms`、`analyze_ms` 算入插入耗时，或反过来忽略插入计时中包含的 Rust 生成、指纹和进度输出成本。
 - 使用 `BETWEEN` 或闭区间导致多计右端点；当前查询固定使用 `[lower, upper)`。
 - 只看“扫描约 500 万”而不检查 `observed_count`；当前默认匹配行数必须精确为 5,000,000。
+- 把 `SKIP LOCKED` 当作 `COUNT(*)` 的附加关键字；它是单独的双事务行锁测试，默认验证 500 个候选、100 个持锁、400 个返回。
+- 在没有另一个事务持锁时运行 `SKIP LOCKED` 并声称验证了跳锁；当前实现会先保持事务 A 的 100 个行锁，再启动事务 B。
 - 把预热后的 5 个 `measured_ms` 当成 5 次冷启动结果。
 - 一边使用 `COPY` 或专用 bulk loader，另一边使用当前多值 `INSERT`，却归因于数据库本身。
 - 一边关闭 fsync/同步提交，另一边保持崩溃安全，或只让一边承担复制与归档日志成本。

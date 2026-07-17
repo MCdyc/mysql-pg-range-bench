@@ -9,7 +9,7 @@
 - 64 位 Linux；
 - Rust stable 和 Cargo；
 - MySQL、PostgreSQL 已经运行，磁盘空间足够；
-- 两个连接账号分别能创建/删除本工具的临时库，并能在其中执行建表、建索引、`INSERT`、`SELECT` 和 `ANALYZE`；建议使用专用最小权限账号，MySQL 可按 `codex_range_bench_` 数据库前缀限制库级权限；
+- 两个连接账号分别能创建/删除本工具的临时库，并能在其中执行建表、建索引、`INSERT`、`SELECT`、`UPDATE`（`FOR UPDATE` 所需）和 `ANALYZE`；建议使用专用最小权限账号，MySQL 可按 `codex_range_bench_` 数据库前缀限制库级权限；
 - PostgreSQL 管理员还需能够终止本次临时数据库的连接。
 
 管理员 URL 必须指向原本就存在的维护数据库，例如：
