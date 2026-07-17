@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
@@ -17,6 +18,8 @@ const FIELD_COUNT: usize = 15;
 const MAX_BIND_PARAMETERS: usize = 60_000;
 const DEFAULT_ROWS: u64 = 30_000_000;
 const DEFAULT_SCAN_ROWS: u64 = 5_000_000;
+const DEFAULT_SKIP_LOCKED_ROWS: u64 = 500;
+const DEFAULT_SKIP_LOCKED_HELD_ROWS: u64 = 100;
 const MAX_QUERY_EXECUTIONS: u32 = 100_000;
 const GENERATOR_VERSION: &str = "splitmix64-v1";
 const FINGERPRINT_ALGORITHM: &str = "fnv1a64-length-prefixed-v1";
@@ -115,6 +118,22 @@ struct Args {
     #[arg(long, env = "BENCH_SCAN_ROWS", default_value_t = DEFAULT_SCAN_ROWS)]
     scan_rows: u64,
 
+    /// Rows in the indexed SKIP LOCKED candidate range.
+    #[arg(
+        long,
+        env = "BENCH_SKIP_LOCKED_ROWS",
+        default_value_t = DEFAULT_SKIP_LOCKED_ROWS
+    )]
+    skip_locked_rows: u64,
+
+    /// Leading candidate rows held by another transaction during SKIP LOCKED.
+    #[arg(
+        long,
+        env = "BENCH_SKIP_LOCKED_HELD_ROWS",
+        default_value_t = DEFAULT_SKIP_LOCKED_HELD_ROWS
+    )]
+    skip_locked_held_rows: u64,
+
     /// Zero-based first generated row in the query range. Defaults to a centered range.
     #[arg(long, env = "BENCH_RANGE_START_ROW")]
     range_start_row: Option<u64>,
@@ -172,6 +191,8 @@ struct ResolvedConfig {
     table: String,
     rows: u64,
     scan_rows: u64,
+    skip_locked_rows: u64,
+    skip_locked_held_rows: u64,
     range_start_row: u64,
     batch_size: usize,
     transaction_rows: u64,
@@ -182,6 +203,7 @@ struct ResolvedConfig {
     base_time: NaiveDateTime,
     lower_bound: NaiveDateTime,
     upper_bound: NaiveDateTime,
+    skip_locked_upper_bound: NaiveDateTime,
     progress_every: u64,
     skip_insert: bool,
     output: PathBuf,
@@ -201,6 +223,20 @@ impl ResolvedConfig {
             "--scan-rows ({}) cannot exceed --rows ({})",
             args.scan_rows,
             args.rows
+        );
+        ensure!(
+            args.skip_locked_rows > 1,
+            "--skip-locked-rows must be greater than one"
+        );
+        ensure!(
+            args.skip_locked_rows <= args.scan_rows,
+            "--skip-locked-rows ({}) cannot exceed --scan-rows ({})",
+            args.skip_locked_rows,
+            args.scan_rows
+        );
+        ensure!(
+            args.skip_locked_held_rows > 0 && args.skip_locked_held_rows < args.skip_locked_rows,
+            "--skip-locked-held-rows must be between 1 and --skip-locked-rows - 1"
         );
         ensure!(
             args.batch_size > 0,
@@ -266,6 +302,10 @@ impl ResolvedConfig {
         let final_event_time = event_time_at(base_time, args.rows - 1)?;
         let lower_bound = event_time_at(base_time, range_start_row)?;
         let upper_bound = event_time_at(base_time, range_end_row)?;
+        let skip_locked_end_row = range_start_row
+            .checked_add(args.skip_locked_rows)
+            .context("SKIP LOCKED range row numbers overflowed u64")?;
+        let skip_locked_upper_bound = event_time_at(base_time, skip_locked_end_row)?;
         ensure!(
             base_time.year() >= 1000
                 && final_event_time.year() <= 9999
@@ -281,6 +321,8 @@ impl ResolvedConfig {
             table: args.table,
             rows: args.rows,
             scan_rows: args.scan_rows,
+            skip_locked_rows: args.skip_locked_rows,
+            skip_locked_held_rows: args.skip_locked_held_rows,
             range_start_row,
             batch_size: args.batch_size,
             transaction_rows: args.transaction_rows,
@@ -291,6 +333,7 @@ impl ResolvedConfig {
             base_time,
             lower_bound,
             upper_bound,
+            skip_locked_upper_bound,
             progress_every: args.progress_every,
             skip_insert: args.skip_insert,
             output: args.output,
@@ -443,6 +486,8 @@ struct ReportConfig {
     table: String,
     rows: u64,
     scan_rows: u64,
+    skip_locked_rows: u64,
+    skip_locked_held_rows: u64,
     range_start_row: u64,
     batch_size: usize,
     transaction_rows: u64,
@@ -529,6 +574,7 @@ struct DatabaseReport {
     insert: Option<InsertReport>,
     analyze_ms: f64,
     query: QueryReport,
+    skip_locked: SkipLockedReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -561,6 +607,28 @@ struct QueryReport {
 }
 
 #[derive(Debug, Serialize)]
+struct SkipLockedReport {
+    holder_sql: String,
+    worker_sql: String,
+    connection_scope: &'static str,
+    transaction_isolation: &'static str,
+    range_semantics: &'static str,
+    lower_bound_utc: String,
+    upper_bound_utc: String,
+    candidate_rows_expected: u64,
+    candidate_rows_observed: u64,
+    held_rows_expected: u64,
+    held_rows_observed: u64,
+    returned_rows_expected: u64,
+    returned_rows_observed: u64,
+    elapsed_ms: f64,
+    expected_index: String,
+    explain_uses_expected_index: bool,
+    explain: ExplainReport,
+    transactions_rolled_back: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ExplainReport {
     format: &'static str,
     analyze: bool,
@@ -585,11 +653,13 @@ async fn main() -> Result<()> {
     let started_at = Utc::now();
 
     eprintln!(
-        "benchmark: rows={}, scan_rows={}, range=[{}..{}), batch_size={}, transaction_rows={}",
+        "benchmark: rows={}, scan_rows={}, range=[{}..{}), skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}",
         config.rows,
         config.scan_rows,
         config.range_start_row,
         config.range_start_row + config.scan_rows,
+        config.skip_locked_rows,
+        config.skip_locked_held_rows,
         config.batch_size,
         config.transaction_rows
     );
@@ -677,7 +747,7 @@ async fn main() -> Result<()> {
     }
 
     let report = BenchmarkReport {
-        report_version: 1,
+        report_version: 2,
         started_at_utc: format_utc(started_at.naive_utc()),
         finished_at_utc: format_utc(Utc::now().naive_utc()),
         config: report_config(&config),
@@ -716,6 +786,7 @@ async fn run_mysql(pool: &MySqlPool, config: &ResolvedConfig) -> Result<Database
     let analyze_ms = elapsed_ms(analyze_started.elapsed());
 
     let query = benchmark_mysql_query(pool, config).await?;
+    let skip_locked = benchmark_mysql_skip_locked(config).await?;
     Ok(DatabaseReport {
         database: "mysql",
         server_version: version,
@@ -723,6 +794,7 @@ async fn run_mysql(pool: &MySqlPool, config: &ResolvedConfig) -> Result<Database
         insert,
         analyze_ms,
         query,
+        skip_locked,
     })
 }
 
@@ -752,6 +824,7 @@ async fn run_postgres(pool: &PgPool, config: &ResolvedConfig) -> Result<Database
     let analyze_ms = elapsed_ms(analyze_started.elapsed());
 
     let query = benchmark_postgres_query(pool, config).await?;
+    let skip_locked = benchmark_postgres_skip_locked(config).await?;
     Ok(DatabaseReport {
         database: "postgres",
         server_version: version,
@@ -759,6 +832,7 @@ async fn run_postgres(pool: &PgPool, config: &ResolvedConfig) -> Result<Database
         insert,
         analyze_ms,
         query,
+        skip_locked,
     })
 }
 
@@ -1112,6 +1186,323 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
     ))
 }
 
+async fn benchmark_mysql_skip_locked(config: &ResolvedConfig) -> Result<SkipLockedReport> {
+    let table = mysql_identifier(&config.table);
+    let expected_index = format!("idx_{}_event_time", config.table);
+    let holder_sql = format!(
+        "SELECT id FROM {table} WHERE event_time >= ? AND event_time < ? ORDER BY event_time LIMIT {} FOR UPDATE",
+        config.skip_locked_held_rows
+    );
+    let worker_sql = format!(
+        "SELECT id FROM {table} WHERE event_time >= ? AND event_time < ? ORDER BY event_time FOR UPDATE SKIP LOCKED"
+    );
+    let count_sql =
+        format!("SELECT COUNT(*) FROM {table} WHERE event_time >= ? AND event_time < ?");
+
+    let pool = MySqlPoolOptions::new()
+        .min_connections(2)
+        .max_connections(2)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET time_zone = '+00:00'")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&config.mysql_url)
+        .await
+        .context("connect two MySQL SKIP LOCKED sessions")?;
+
+    let candidate_count: i64 = sqlx::query_scalar(&count_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_one(&pool)
+        .await
+        .context("count MySQL SKIP LOCKED candidate rows")?;
+    let candidate_rows_observed = validate_count(
+        "MySQL SKIP LOCKED candidate",
+        candidate_count,
+        config.skip_locked_rows,
+    )?;
+
+    let explain_sql = format!("EXPLAIN FORMAT=JSON {worker_sql}");
+    let explain_text: String = sqlx::query_scalar(&explain_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_one(&pool)
+        .await
+        .context("EXPLAIN MySQL SKIP LOCKED query")?;
+    let explain_plan: serde_json::Value =
+        serde_json::from_str(&explain_text).context("parse MySQL SKIP LOCKED EXPLAIN JSON")?;
+    let explain_uses_expected_index = json_field_equals(&explain_plan, "key", &expected_index);
+    ensure!(
+        explain_uses_expected_index,
+        "MySQL SKIP LOCKED EXPLAIN did not select expected event_time index {expected_index}"
+    );
+    let explain = ExplainReport {
+        format: "json",
+        analyze: false,
+        plan: explain_plan,
+    };
+
+    let mut holder_transaction = pool
+        .begin()
+        .await
+        .context("begin MySQL lock-holder transaction")?;
+    let held_ids: Vec<i64> = sqlx::query_scalar(&holder_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_all(&mut *holder_transaction)
+        .await
+        .context("lock the leading MySQL SKIP LOCKED rows")?;
+    let held_rows_observed =
+        u64::try_from(held_ids.len()).context("MySQL held-row count does not fit u64")?;
+    ensure!(
+        held_rows_observed == config.skip_locked_held_rows,
+        "MySQL lock holder selected {held_rows_observed} rows, expected exactly {}",
+        config.skip_locked_held_rows
+    );
+
+    let mut worker_transaction = pool
+        .begin()
+        .await
+        .context("begin MySQL SKIP LOCKED worker transaction")?;
+    let started = Instant::now();
+    let returned_result = sqlx::query_scalar(&worker_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_all(&mut *worker_transaction)
+        .await;
+    let duration = elapsed_ms(started.elapsed());
+
+    let worker_rollback = worker_transaction.rollback().await;
+    let holder_rollback = holder_transaction.rollback().await;
+    let returned_ids: Vec<i64> = returned_result.context("execute MySQL FOR UPDATE SKIP LOCKED")?;
+    worker_rollback.context("roll back MySQL SKIP LOCKED worker transaction")?;
+    holder_rollback.context("roll back MySQL lock-holder transaction")?;
+    pool.close().await;
+
+    let returned_rows_expected = config.skip_locked_rows - config.skip_locked_held_rows;
+    let returned_rows_observed = validate_skip_locked_ids(
+        "MySQL",
+        &held_ids,
+        &returned_ids,
+        config.skip_locked_held_rows,
+        returned_rows_expected,
+    )?;
+
+    Ok(SkipLockedReport {
+        holder_sql,
+        worker_sql,
+        connection_scope: "two dedicated concurrent connections; holder locks first, worker uses SKIP LOCKED",
+        transaction_isolation: "READ COMMITTED",
+        range_semantics: "first skip_locked_rows rows of the main indexed range",
+        lower_bound_utc: format_utc(config.lower_bound),
+        upper_bound_utc: format_utc(config.skip_locked_upper_bound),
+        candidate_rows_expected: config.skip_locked_rows,
+        candidate_rows_observed,
+        held_rows_expected: config.skip_locked_held_rows,
+        held_rows_observed,
+        returned_rows_expected,
+        returned_rows_observed,
+        elapsed_ms: duration,
+        expected_index,
+        explain_uses_expected_index,
+        explain,
+        transactions_rolled_back: true,
+    })
+}
+
+async fn benchmark_postgres_skip_locked(config: &ResolvedConfig) -> Result<SkipLockedReport> {
+    let table = postgres_identifier(&config.table);
+    let expected_index = format!("idx_{}_event_time", config.table);
+    let holder_sql = format!(
+        "SELECT id FROM {table} WHERE event_time >= $1 AND event_time < $2 ORDER BY event_time LIMIT {} FOR UPDATE",
+        config.skip_locked_held_rows
+    );
+    let worker_sql = format!(
+        "SELECT id FROM {table} WHERE event_time >= $1 AND event_time < $2 ORDER BY event_time FOR UPDATE SKIP LOCKED"
+    );
+    let count_sql =
+        format!("SELECT COUNT(*) FROM {table} WHERE event_time >= $1 AND event_time < $2");
+
+    let pool = PgPoolOptions::new()
+        .min_connections(2)
+        .max_connections(2)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET TIME ZONE 'UTC'")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SET default_transaction_isolation = 'read committed'")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SET max_parallel_workers_per_gather = 0")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&config.postgres_url)
+        .await
+        .context("connect two PostgreSQL SKIP LOCKED sessions")?;
+
+    let candidate_count: i64 = sqlx::query_scalar(&count_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_one(&pool)
+        .await
+        .context("count PostgreSQL SKIP LOCKED candidate rows")?;
+    let candidate_rows_observed = validate_count(
+        "PostgreSQL SKIP LOCKED candidate",
+        candidate_count,
+        config.skip_locked_rows,
+    )?;
+
+    let explain_sql = format!("EXPLAIN (FORMAT JSON) {worker_sql}");
+    let explain_plan: serde_json::Value = sqlx::query_scalar(&explain_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_one(&pool)
+        .await
+        .context("EXPLAIN PostgreSQL SKIP LOCKED query")?;
+    let explain_uses_expected_index =
+        json_field_equals(&explain_plan, "Index Name", &expected_index);
+    ensure!(
+        explain_uses_expected_index,
+        "PostgreSQL SKIP LOCKED EXPLAIN did not select expected event_time index {expected_index}"
+    );
+    let explain = ExplainReport {
+        format: "json",
+        analyze: false,
+        plan: explain_plan,
+    };
+
+    let mut holder_transaction = pool
+        .begin()
+        .await
+        .context("begin PostgreSQL lock-holder transaction")?;
+    let held_ids: Vec<i64> = sqlx::query_scalar(&holder_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_all(&mut *holder_transaction)
+        .await
+        .context("lock the leading PostgreSQL SKIP LOCKED rows")?;
+    let held_rows_observed =
+        u64::try_from(held_ids.len()).context("PostgreSQL held-row count does not fit u64")?;
+    ensure!(
+        held_rows_observed == config.skip_locked_held_rows,
+        "PostgreSQL lock holder selected {held_rows_observed} rows, expected exactly {}",
+        config.skip_locked_held_rows
+    );
+
+    let mut worker_transaction = pool
+        .begin()
+        .await
+        .context("begin PostgreSQL SKIP LOCKED worker transaction")?;
+    let started = Instant::now();
+    let returned_result = sqlx::query_scalar(&worker_sql)
+        .bind(config.lower_bound)
+        .bind(config.skip_locked_upper_bound)
+        .fetch_all(&mut *worker_transaction)
+        .await;
+    let duration = elapsed_ms(started.elapsed());
+
+    let worker_rollback = worker_transaction.rollback().await;
+    let holder_rollback = holder_transaction.rollback().await;
+    let returned_ids: Vec<i64> =
+        returned_result.context("execute PostgreSQL FOR UPDATE SKIP LOCKED")?;
+    worker_rollback.context("roll back PostgreSQL SKIP LOCKED worker transaction")?;
+    holder_rollback.context("roll back PostgreSQL lock-holder transaction")?;
+    pool.close().await;
+
+    let returned_rows_expected = config.skip_locked_rows - config.skip_locked_held_rows;
+    let returned_rows_observed = validate_skip_locked_ids(
+        "PostgreSQL",
+        &held_ids,
+        &returned_ids,
+        config.skip_locked_held_rows,
+        returned_rows_expected,
+    )?;
+
+    Ok(SkipLockedReport {
+        holder_sql,
+        worker_sql,
+        connection_scope: "two dedicated concurrent connections; holder locks first, worker uses SKIP LOCKED",
+        transaction_isolation: "READ COMMITTED",
+        range_semantics: "first skip_locked_rows rows of the main indexed range",
+        lower_bound_utc: format_utc(config.lower_bound),
+        upper_bound_utc: format_utc(config.skip_locked_upper_bound),
+        candidate_rows_expected: config.skip_locked_rows,
+        candidate_rows_observed,
+        held_rows_expected: config.skip_locked_held_rows,
+        held_rows_observed,
+        returned_rows_expected,
+        returned_rows_observed,
+        elapsed_ms: duration,
+        expected_index,
+        explain_uses_expected_index,
+        explain,
+        transactions_rolled_back: true,
+    })
+}
+
+fn validate_skip_locked_ids(
+    database: &str,
+    held_ids: &[i64],
+    returned_ids: &[i64],
+    expected_held: u64,
+    expected_returned: u64,
+) -> Result<u64> {
+    let held_count =
+        u64::try_from(held_ids.len()).context("held SKIP LOCKED row count does not fit u64")?;
+    let returned_count = u64::try_from(returned_ids.len())
+        .context("returned SKIP LOCKED row count does not fit u64")?;
+    ensure!(
+        held_count == expected_held,
+        "{database} held {held_count} rows, expected exactly {expected_held}"
+    );
+    ensure!(
+        returned_count == expected_returned,
+        "{database} SKIP LOCKED returned {returned_count} rows, expected exactly {expected_returned}"
+    );
+
+    let held_set: HashSet<i64> = held_ids.iter().copied().collect();
+    let returned_set: HashSet<i64> = returned_ids.iter().copied().collect();
+    ensure!(
+        held_set.len() == held_ids.len(),
+        "{database} lock-holder query returned duplicate row identifiers"
+    );
+    ensure!(
+        returned_set.len() == returned_ids.len(),
+        "{database} SKIP LOCKED query returned duplicate row identifiers"
+    );
+    ensure!(
+        held_set.is_disjoint(&returned_set),
+        "{database} SKIP LOCKED returned one or more rows held by the other transaction"
+    );
+    Ok(returned_count)
+}
+
+fn json_field_equals(value: &serde_json::Value, field: &str, expected: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.get(field).and_then(serde_json::Value::as_str) == Some(expected)
+                || object
+                    .values()
+                    .any(|child| json_field_equals(child, field, expected))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|child| json_field_equals(child, field, expected)),
+        _ => false,
+    }
+}
+
 fn validate_count(database: &str, count: i64, expected: u64) -> Result<u64> {
     let count = u64::try_from(count).context("COUNT(*) returned a negative value")?;
     ensure!(
@@ -1237,6 +1628,15 @@ fn print_console_summary(report: &DatabaseReport) {
         report.query.summary_ms.p95,
         report.query.summary_ms.max
     );
+    eprintln!(
+        "{} summary: SKIP LOCKED candidates={}, held={}, returned={}, query ms={:.3}, event_time_index_used={}",
+        report.database,
+        report.skip_locked.candidate_rows_observed,
+        report.skip_locked.held_rows_observed,
+        report.skip_locked.returned_rows_observed,
+        report.skip_locked.elapsed_ms,
+        report.skip_locked.explain_uses_expected_index
+    );
 }
 
 fn report_config(config: &ResolvedConfig) -> ReportConfig {
@@ -1245,6 +1645,8 @@ fn report_config(config: &ResolvedConfig) -> ReportConfig {
         table: config.table.clone(),
         rows: config.rows,
         scan_rows: config.scan_rows,
+        skip_locked_rows: config.skip_locked_rows,
+        skip_locked_held_rows: config.skip_locked_held_rows,
         range_start_row: config.range_start_row,
         batch_size: config.batch_size,
         transaction_rows: config.transaction_rows,
@@ -1396,6 +1798,8 @@ mod tests {
             table: "benchmark_events".to_owned(),
             rows: 30_000_000,
             scan_rows: 5_000_000,
+            skip_locked_rows: 500,
+            skip_locked_held_rows: 100,
             range_start_row: None,
             batch_size: 1_000,
             transaction_rows: 100_000,
@@ -1460,6 +1864,70 @@ mod tests {
     }
 
     #[test]
+    fn default_skip_locked_range_is_exactly_five_hundred_rows() {
+        let config = test_config();
+        assert_eq!(config.skip_locked_rows, 500);
+        assert_eq!(config.skip_locked_held_rows, 100);
+        assert_eq!(
+            config.skip_locked_upper_bound - config.lower_bound,
+            Duration::seconds(500)
+        );
+        assert_eq!(config.skip_locked_rows - config.skip_locked_held_rows, 400);
+    }
+
+    #[test]
+    fn skip_locked_validation_requires_exact_disjoint_unique_rows() {
+        let held = [1, 2];
+        let returned = [3, 4, 5];
+        assert_eq!(
+            validate_skip_locked_ids("test", &held, &returned, 2, 3)
+                .expect("valid SKIP LOCKED result"),
+            3
+        );
+        assert!(
+            validate_skip_locked_ids("test", &held, &[2, 3, 4], 2, 3).is_err(),
+            "a held row must never be returned"
+        );
+        assert!(
+            validate_skip_locked_ids("test", &held, &[3, 3, 4], 2, 3).is_err(),
+            "duplicate returned identifiers must fail"
+        );
+        assert!(
+            validate_skip_locked_ids("test", &held, &[3, 4], 2, 3).is_err(),
+            "the returned count must be exact"
+        );
+    }
+
+    #[test]
+    fn explain_index_detection_uses_the_actual_plan_field() {
+        let mysql_plan = serde_json::json!({
+            "query_block": {
+                "table": {
+                    "possible_keys": ["idx_benchmark_events_event_time"],
+                    "key": "another_index"
+                }
+            }
+        });
+        assert!(!json_field_equals(
+            &mysql_plan,
+            "key",
+            "idx_benchmark_events_event_time"
+        ));
+
+        let postgres_plan = serde_json::json!([{
+            "Plan": {
+                "Node Type": "Index Scan",
+                "Index Name": "idx_benchmark_events_event_time"
+            }
+        }]);
+        assert!(json_field_equals(
+            &postgres_plan,
+            "Index Name",
+            "idx_benchmark_events_event_time"
+        ));
+    }
+
+    #[test]
     fn reported_model_has_fifteen_not_null_columns_and_one_time_index() {
         let config = test_config();
         let model = data_model_report(&config).expect("build data-model report");
@@ -1481,6 +1949,8 @@ mod tests {
             table: "benchmark_events".to_owned(),
             rows: 10,
             scan_rows: 5,
+            skip_locked_rows: 5,
+            skip_locked_held_rows: 1,
             range_start_row: None,
             batch_size: MAX_BIND_PARAMETERS / FIELD_COUNT + 1,
             transaction_rows: 10,
@@ -1502,6 +1972,8 @@ mod tests {
             table: "benchmark_events".to_owned(),
             rows: 10,
             scan_rows: 5,
+            skip_locked_rows: 5,
+            skip_locked_held_rows: 1,
             range_start_row: None,
             batch_size: MAX_BIND_PARAMETERS / FIELD_COUNT,
             transaction_rows: 10,

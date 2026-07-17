@@ -69,10 +69,11 @@ bash scripts/linux/run-one-click.sh
 2. 检查固定版本的 MySQL、PostgreSQL 镜像；缺失时自动下载。
 3. 启动或复用 `.local-db/data/` 中的 MySQL、PostgreSQL。
 4. 测试前清理上一次不可捕获中断可能遗留的 `codex_range_bench_<UUID>` 数据库。
-5. Rust 程序在两边创建本次专用随机数据库，写入相同数据并执行范围查询。
-6. 正常、失败、`Ctrl+C`、`SIGTERM` 或 `SIGHUP` 后，Rust 按精确名称删除本次测试数据库。
-7. 外层脚本再次只在这两套项目本地实例内枚举合法 UUID 名，删除遗留项并查询系统目录验证数量为零。
-8. 保留 MySQL/PostgreSQL 实例、随机凭据和空的维护数据库，供下次测试复用。
+5. Rust 程序在两边创建本次专用随机数据库，写入相同数据并执行 500 万行范围计数。
+6. 每个数据库使用两个 `READ COMMITTED` 事务验证 `SKIP LOCKED`：500 行候选范围中持锁 100 行，另一连接必须通过时间索引返回其余 400 行，随后两个事务回滚。
+7. 正常、失败、`Ctrl+C`、`SIGTERM` 或 `SIGHUP` 后，Rust 按精确名称删除本次测试数据库。
+8. 外层脚本再次只在这两套项目本地实例内枚举合法 UUID 名，删除遗留项并查询系统目录验证数量为零。
+9. 保留 MySQL/PostgreSQL 实例、随机凭据和空的维护数据库，供下次测试复用。
 
 测试结果与清理回执保留在 `benchmark-results/`，数据库表、索引和测试数据库不会保留。
 

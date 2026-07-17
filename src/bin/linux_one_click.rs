@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 const DEFAULT_ROWS: u64 = 30_000_000;
 const DEFAULT_SCAN_ROWS: u64 = 5_000_000;
+const DEFAULT_SKIP_LOCKED_ROWS: u64 = 500;
+const DEFAULT_SKIP_LOCKED_HELD_ROWS: u64 = 100;
 const DATABASE_PREFIX: &str = "codex_range_bench_";
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -43,6 +45,22 @@ struct Args {
     /// Number of rows covered by the indexed range query.
     #[arg(long, env = "BENCH_SCAN_ROWS", default_value_t = DEFAULT_SCAN_ROWS)]
     scan_rows: u64,
+
+    /// Rows in the indexed SKIP LOCKED candidate range.
+    #[arg(
+        long,
+        env = "BENCH_SKIP_LOCKED_ROWS",
+        default_value_t = DEFAULT_SKIP_LOCKED_ROWS
+    )]
+    skip_locked_rows: u64,
+
+    /// Leading candidate rows held by another transaction.
+    #[arg(
+        long,
+        env = "BENCH_SKIP_LOCKED_HELD_ROWS",
+        default_value_t = DEFAULT_SKIP_LOCKED_HELD_ROWS
+    )]
+    skip_locked_held_rows: u64,
 
     /// Rows per multi-value insert.
     #[arg(long, env = "BENCH_BATCH_SIZE", default_value_t = 1_000)]
@@ -83,6 +101,8 @@ struct Config {
     postgres_admin_url: String,
     rows: u64,
     scan_rows: u64,
+    skip_locked_rows: u64,
+    skip_locked_held_rows: u64,
     batch_size: usize,
     transaction_rows: u64,
     warmups: u32,
@@ -98,6 +118,14 @@ impl Config {
         ensure!(
             args.scan_rows > 0 && args.scan_rows <= args.rows,
             "--scan-rows must be between 1 and --rows"
+        );
+        ensure!(
+            args.skip_locked_rows > 1 && args.skip_locked_rows <= args.scan_rows,
+            "--skip-locked-rows must be between 2 and --scan-rows"
+        );
+        ensure!(
+            args.skip_locked_held_rows > 0 && args.skip_locked_held_rows < args.skip_locked_rows,
+            "--skip-locked-held-rows must be between 1 and --skip-locked-rows - 1"
         );
         ensure!(
             args.batch_size > 0,
@@ -125,6 +153,8 @@ impl Config {
             postgres_admin_url: args.postgres_admin_url,
             rows: args.rows,
             scan_rows: args.scan_rows,
+            skip_locked_rows: args.skip_locked_rows,
+            skip_locked_held_rows: args.skip_locked_held_rows,
             batch_size: args.batch_size,
             transaction_rows: args.transaction_rows,
             warmups: args.warmups,
@@ -522,6 +552,14 @@ fn benchmark_command(
         .env("BENCH_DATABASE", "both")
         .env("BENCH_ROWS", config.rows.to_string())
         .env("BENCH_SCAN_ROWS", config.scan_rows.to_string())
+        .env(
+            "BENCH_SKIP_LOCKED_ROWS",
+            config.skip_locked_rows.to_string(),
+        )
+        .env(
+            "BENCH_SKIP_LOCKED_HELD_ROWS",
+            config.skip_locked_held_rows.to_string(),
+        )
         .env("BENCH_BATCH_SIZE", config.batch_size.to_string())
         .env(
             "BENCH_TRANSACTION_ROWS",

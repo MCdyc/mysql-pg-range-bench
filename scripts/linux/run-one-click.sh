@@ -41,6 +41,7 @@ instances, while keeping the instances available for the next run.
 
 Default run:
   30,000,000 inserted rows per database and a 5,000,000-row range query.
+  SKIP LOCKED then checks 500 indexed rows: 100 held and 400 returned.
 
 Smoke run:
   bash scripts/linux/run-one-click.sh --smoke=100k/20k
