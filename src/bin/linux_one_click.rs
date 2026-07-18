@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{SecondsFormat, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -22,6 +22,21 @@ const DEFAULT_SKIP_LOCKED_ROWS: u64 = 500;
 const DEFAULT_SKIP_LOCKED_HELD_ROWS: u64 = 100;
 const DATABASE_PREFIX: &str = "codex_range_bench_";
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum QueryRangeMode {
+    Same,
+    Different,
+}
+
+impl QueryRangeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Different => "different",
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -78,6 +93,15 @@ struct Args {
     #[arg(long, env = "BENCH_RUNS", default_value_t = 5)]
     runs: u32,
 
+    /// Reuse one range or spread measured queries across different ranges.
+    #[arg(
+        long,
+        env = "BENCH_QUERY_RANGES",
+        value_enum,
+        default_value_t = QueryRangeMode::Same
+    )]
+    query_ranges: QueryRangeMode,
+
     /// Skip ANALYZE/VACUUM maintenance before the range query.
     #[arg(long, env = "BENCH_SKIP_MAINTENANCE", default_value_t = false)]
     skip_maintenance: bool,
@@ -115,6 +139,7 @@ struct Config {
     transaction_rows: u64,
     warmups: u32,
     runs: u32,
+    query_ranges: QueryRangeMode,
     skip_maintenance: bool,
     skip_lock_test: bool,
     progress_every: u64,
@@ -149,6 +174,23 @@ impl Config {
             "--transaction-rows must be greater than zero"
         );
         ensure!(args.runs > 0, "--runs must be greater than zero");
+        if matches!(args.query_ranges, QueryRangeMode::Different) {
+            ensure!(
+                args.warmups == 0,
+                "--query-ranges different requires --warmups 0"
+            );
+            ensure!(
+                args.runs > 1,
+                "--query-ranges different requires --runs greater than one"
+            );
+            ensure!(
+                args.rows - args.scan_rows >= u64::from(args.runs - 1),
+                "--query-ranges different cannot produce {} unique ranges from {} rows with --scan-rows {}",
+                args.runs,
+                args.rows,
+                args.scan_rows
+            );
+        }
 
         validate_admin_url(&args.mysql_admin_url, "mysql")?;
         validate_admin_url(&args.postgres_admin_url, "postgres")?;
@@ -172,6 +214,7 @@ impl Config {
             transaction_rows: args.transaction_rows,
             warmups: args.warmups,
             runs: args.runs,
+            query_ranges: args.query_ranges,
             skip_maintenance: args.skip_maintenance,
             skip_lock_test: args.skip_lock_test,
             progress_every: args.progress_every,
@@ -582,6 +625,7 @@ fn benchmark_command(
         )
         .env("BENCH_WARMUPS", config.warmups.to_string())
         .env("BENCH_RUNS", config.runs.to_string())
+        .env("BENCH_QUERY_RANGES", config.query_ranges.as_str())
         .env(
             "BENCH_SKIP_MAINTENANCE",
             config.skip_maintenance.to_string(),
@@ -1112,6 +1156,30 @@ mod tests {
         Config::from_args(args).expect("disabled lock test should ignore its unused range defaults")
     }
 
+    fn ten_different_ranges_config() -> Config {
+        let args = Args::try_parse_from([
+            "linux-one-click",
+            "--mysql-admin-url",
+            "mysql://root:password@localhost:3306/mysql",
+            "--postgres-admin-url",
+            "postgres://postgres:password@localhost:5432/postgres",
+            "--rows",
+            "100",
+            "--scan-rows",
+            "20",
+            "--warmups",
+            "0",
+            "--runs",
+            "10",
+            "--query-ranges",
+            "different",
+            "--skip-maintenance",
+            "--skip-lock-test",
+        ])
+        .expect("ten different range arguments should parse");
+        Config::from_args(args).expect("ten different ranges should be valid")
+    }
+
     #[test]
     fn query_once_flags_parse_and_bypass_unused_lock_range_validation() {
         let config = query_once_config();
@@ -1159,6 +1227,40 @@ mod tests {
             Some("0")
         );
         assert_eq!(environment.get("BENCH_RUNS").map(String::as_str), Some("1"));
+        assert_eq!(
+            environment.get("BENCH_QUERY_RANGES").map(String::as_str),
+            Some("same")
+        );
+    }
+
+    #[test]
+    fn different_query_ranges_parse_validate_and_reach_the_benchmark_child() {
+        let config = ten_different_ranges_config();
+        let command = benchmark_command(
+            Path::new("mysql-pg-range-bench"),
+            &config,
+            "mysql://benchmark:password@localhost/test",
+            "postgres://benchmark:password@localhost/test",
+        );
+        let environment = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(config.warmups, 0);
+        assert_eq!(config.runs, 10);
+        assert_eq!(
+            environment.get("BENCH_QUERY_RANGES").map(String::as_str),
+            Some("different")
+        );
     }
 
     #[test]
