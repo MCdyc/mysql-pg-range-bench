@@ -90,6 +90,22 @@ bash scripts/linux/run-query-once.sh
 bash scripts/linux/run-query-once.sh --smoke
 ```
 
+## Linux 零预热十次查询
+
+插入完成后，对完全相同的时间范围连续查询十次：
+
+```bash
+bash scripts/linux/run-query-ten-same.sh
+```
+
+插入完成后，在整张表的时间轴上等距选择十个不同范围并各查询一次：
+
+```bash
+bash scripts/linux/run-query-ten-different.sh
+```
+
+两个入口均固定 `warmups=0`，跳过维护与 `SKIP LOCKED`，并在终端逐次输出行范围、时间范围、实际计数和毫秒耗时。JSON 的 `results[].query.measured_queries` 保存相同明细，`measured_ms` 继续保存十个耗时值。默认每个范围精确命中 500 万行；十个不同范围会部分重叠，但条件彼此不同且可复现。可添加 `--smoke` 做 10 万行/2 万行验证。
+
 ## Linux 已有数据只读单次查询
 
 如果数据库中已经保留了符合本项目 schema 和确定性时间规则的 `benchmark_events` 表，可用只读脚本测量一次范围查询：

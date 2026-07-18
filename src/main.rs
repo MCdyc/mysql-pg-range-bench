@@ -79,6 +79,21 @@ impl DatabaseSelection {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum QueryRangeMode {
+    Same,
+    Different,
+}
+
+impl QueryRangeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Different => "different",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -154,6 +169,15 @@ struct Args {
     #[arg(long, env = "BENCH_RUNS", default_value_t = 5)]
     runs: u32,
 
+    /// Reuse one range or spread measured queries across different ranges.
+    #[arg(
+        long,
+        env = "BENCH_QUERY_RANGES",
+        value_enum,
+        default_value_t = QueryRangeMode::Same
+    )]
+    query_ranges: QueryRangeMode,
+
     /// Maximum database connections in each pool.
     #[arg(long, env = "BENCH_POOL_SIZE", default_value_t = 1)]
     pool_size: u32,
@@ -206,6 +230,7 @@ struct ResolvedConfig {
     transaction_rows: u64,
     warmups: u32,
     runs: u32,
+    query_ranges: QueryRangeMode,
     pool_size: u32,
     seed: u64,
     base_time: NaiveDateTime,
@@ -272,6 +297,27 @@ impl ResolvedConfig {
             "--transaction-rows must be greater than zero"
         );
         ensure!(args.runs > 0, "--runs must be greater than zero");
+        if matches!(args.query_ranges, QueryRangeMode::Different) {
+            ensure!(
+                args.warmups == 0,
+                "--query-ranges different requires --warmups 0"
+            );
+            ensure!(
+                args.runs > 1,
+                "--query-ranges different requires --runs greater than one"
+            );
+            ensure!(
+                args.range_start_row.is_none(),
+                "--range-start-row cannot be combined with --query-ranges different"
+            );
+            ensure!(
+                args.rows - args.scan_rows >= u64::from(args.runs - 1),
+                "--query-ranges different cannot produce {} unique ranges from {} rows with --scan-rows {}",
+                args.runs,
+                args.rows,
+                args.scan_rows
+            );
+        }
         let query_executions = args
             .warmups
             .checked_add(args.runs)
@@ -282,9 +328,12 @@ impl ResolvedConfig {
         );
         ensure!(args.pool_size > 0, "--pool-size must be greater than zero");
 
-        let range_start_row = args
-            .range_start_row
-            .unwrap_or((args.rows - args.scan_rows) / 2);
+        let range_start_row = match args.query_ranges {
+            QueryRangeMode::Same => args
+                .range_start_row
+                .unwrap_or((args.rows - args.scan_rows) / 2),
+            QueryRangeMode::Different => 0,
+        };
         let range_end_row = range_start_row
             .checked_add(args.scan_rows)
             .context("query range row numbers overflowed u64")?;
@@ -345,6 +394,7 @@ impl ResolvedConfig {
             transaction_rows: args.transaction_rows,
             warmups: args.warmups,
             runs: args.runs,
+            query_ranges: args.query_ranges,
             pool_size: args.pool_size,
             seed: args.seed,
             base_time,
@@ -512,6 +562,7 @@ struct ReportConfig {
     transaction_rows: u64,
     warmups: u32,
     measured_runs: u32,
+    query_ranges: &'static str,
     pool_size: u32,
     progress_every: u64,
     seed: u64,
@@ -618,6 +669,8 @@ struct QueryReport {
     sql: String,
     connection_scope: &'static str,
     explain: ExplainReport,
+    explain_range: &'static str,
+    range_mode: &'static str,
     range_semantics: &'static str,
     lower_bound_utc: String,
     upper_bound_utc: String,
@@ -625,7 +678,20 @@ struct QueryReport {
     observed_count: u64,
     warmup_ms: Vec<f64>,
     measured_ms: Vec<f64>,
+    measured_queries: Vec<TimedRangeQueryReport>,
     summary_ms: TimingSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct TimedRangeQueryReport {
+    run_number: u32,
+    range_start_row: u64,
+    range_end_row: u64,
+    lower_bound_utc: String,
+    upper_bound_utc: String,
+    expected_count: u64,
+    observed_count: u64,
+    elapsed_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -675,11 +741,14 @@ async fn main() -> Result<()> {
     let started_at = Utc::now();
 
     eprintln!(
-        "benchmark: rows={}, scan_rows={}, range=[{}..{}), skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}, maintenance={}, lock_test={}",
+        "benchmark: rows={}, scan_rows={}, range=[{}..{}), query_ranges={}, warmups={}, measured_runs={}, skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}, maintenance={}, lock_test={}",
         config.rows,
         config.scan_rows,
         config.range_start_row,
         config.range_start_row + config.scan_rows,
+        config.query_ranges.as_str(),
+        config.warmups,
+        config.runs,
         config.skip_locked_rows,
         config.skip_locked_held_rows,
         config.batch_size,
@@ -771,7 +840,7 @@ async fn main() -> Result<()> {
     }
 
     let report = BenchmarkReport {
-        report_version: 4,
+        report_version: 5,
         started_at_utc: format_utc(started_at.naive_utc()),
         finished_at_utc: format_utc(Utc::now().naive_utc()),
         config: report_config(&config),
@@ -1119,6 +1188,78 @@ fn generate_batch(start: u64, end: u64, config: &ResolvedConfig) -> Result<Vec<B
     Ok(rows)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QueryRange {
+    start_row: u64,
+    end_row: u64,
+    lower_bound: NaiveDateTime,
+    upper_bound: NaiveDateTime,
+}
+
+fn measured_query_range(config: &ResolvedConfig, measured_index: u32) -> Result<QueryRange> {
+    ensure!(
+        measured_index < config.runs,
+        "measured query index {measured_index} is outside configured runs {}",
+        config.runs
+    );
+    let start_row = match config.query_ranges {
+        QueryRangeMode::Same => config.range_start_row,
+        QueryRangeMode::Different => {
+            let numerator = u128::from(measured_index) * u128::from(config.rows - config.scan_rows);
+            let denominator = u128::from(config.runs - 1);
+            u64::try_from(numerator / denominator)
+                .context("different query range start does not fit u64")?
+        }
+    };
+    let end_row = start_row
+        .checked_add(config.scan_rows)
+        .context("measured query range row numbers overflowed u64")?;
+    ensure!(
+        end_row <= config.rows,
+        "measured query range [{start_row}..{end_row}) lies outside rows [0..{})",
+        config.rows
+    );
+    Ok(QueryRange {
+        start_row,
+        end_row,
+        lower_bound: event_time_at(config.base_time, start_row)?,
+        upper_bound: event_time_at(config.base_time, end_row)?,
+    })
+}
+
+fn timed_query_report(
+    run_number: u32,
+    range: QueryRange,
+    expected_count: u64,
+    observed_count: u64,
+    elapsed_ms: f64,
+) -> TimedRangeQueryReport {
+    TimedRangeQueryReport {
+        run_number,
+        range_start_row: range.start_row,
+        range_end_row: range.end_row,
+        lower_bound_utc: format_utc(range.lower_bound),
+        upper_bound_utc: format_utc(range.upper_bound),
+        expected_count,
+        observed_count,
+        elapsed_ms,
+    }
+}
+
+fn print_measured_query(database: &str, total_runs: u32, query: &TimedRangeQueryReport) {
+    eprintln!(
+        "{database} measured query {}/{}: rows=[{}..{}), time=[{}..{}), COUNT(*)={}, elapsed_ms={:.3}",
+        query.run_number,
+        total_runs,
+        query.range_start_row,
+        query.range_end_row,
+        query.lower_bound_utc,
+        query.upper_bound_utc,
+        query.observed_count,
+        query.elapsed_ms
+    );
+}
+
 async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Result<QueryReport> {
     let sql = format!(
         "SELECT COUNT(*) FROM {} WHERE event_time >= ? AND event_time < ?",
@@ -1128,10 +1269,11 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
         .acquire()
         .await
         .context("acquire one MySQL query connection")?;
+    let explain_range = measured_query_range(config, 0)?;
     let explain_sql = format!("EXPLAIN FORMAT=JSON {sql}");
     let explain_text: String = sqlx::query_scalar(&explain_sql)
-        .bind(config.lower_bound)
-        .bind(config.upper_bound)
+        .bind(explain_range.lower_bound)
+        .bind(explain_range.upper_bound)
         .fetch_one(&mut *connection)
         .await
         .context("EXPLAIN MySQL range COUNT(*)")?;
@@ -1144,10 +1286,10 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
         plan: explain_plan,
     };
     let mut warmup_ms = Vec::with_capacity(config.warmups as usize);
-    let mut measured_ms = Vec::with_capacity(config.runs as usize);
+    let mut measured_queries = Vec::with_capacity(config.runs as usize);
     let mut observed_count = 0_u64;
 
-    for run in 0..(config.warmups + config.runs) {
+    for _ in 0..config.warmups {
         let started = Instant::now();
         let count: i64 = sqlx::query_scalar(&sql)
             .bind(config.lower_bound)
@@ -1157,20 +1299,44 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
             .context("execute MySQL range COUNT(*)")?;
         let duration = elapsed_ms(started.elapsed());
         observed_count = validate_count("MySQL", count, config.scan_rows)?;
-        if run < config.warmups {
-            warmup_ms.push(duration);
-        } else {
-            measured_ms.push(duration);
-        }
+        warmup_ms.push(duration);
+    }
+
+    for measured_index in 0..config.runs {
+        let range = measured_query_range(config, measured_index)?;
+        let started = Instant::now();
+        let count: i64 = sqlx::query_scalar(&sql)
+            .bind(range.lower_bound)
+            .bind(range.upper_bound)
+            .fetch_one(&mut *connection)
+            .await
+            .with_context(|| {
+                format!(
+                    "execute MySQL measured range COUNT(*) run {}",
+                    measured_index + 1
+                )
+            })?;
+        let duration = elapsed_ms(started.elapsed());
+        observed_count = validate_count("MySQL", count, config.scan_rows)?;
+        let measured = timed_query_report(
+            measured_index + 1,
+            range,
+            config.scan_rows,
+            observed_count,
+            duration,
+        );
+        print_measured_query("MySQL", config.runs, &measured);
+        measured_queries.push(measured);
     }
 
     Ok(query_report(
         sql,
         explain,
+        explain_range,
         config,
         observed_count,
         warmup_ms,
-        measured_ms,
+        measured_queries,
     ))
 }
 
@@ -1183,10 +1349,11 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
         .acquire()
         .await
         .context("acquire one PostgreSQL query connection")?;
+    let explain_range = measured_query_range(config, 0)?;
     let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
     let explain_plan: serde_json::Value = sqlx::query_scalar(&explain_sql)
-        .bind(config.lower_bound)
-        .bind(config.upper_bound)
+        .bind(explain_range.lower_bound)
+        .bind(explain_range.upper_bound)
         .fetch_one(&mut *connection)
         .await
         .context("EXPLAIN PostgreSQL range COUNT(*)")?;
@@ -1196,10 +1363,10 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
         plan: explain_plan,
     };
     let mut warmup_ms = Vec::with_capacity(config.warmups as usize);
-    let mut measured_ms = Vec::with_capacity(config.runs as usize);
+    let mut measured_queries = Vec::with_capacity(config.runs as usize);
     let mut observed_count = 0_u64;
 
-    for run in 0..(config.warmups + config.runs) {
+    for _ in 0..config.warmups {
         let started = Instant::now();
         let count: i64 = sqlx::query_scalar(&sql)
             .bind(config.lower_bound)
@@ -1209,20 +1376,44 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
             .context("execute PostgreSQL range COUNT(*)")?;
         let duration = elapsed_ms(started.elapsed());
         observed_count = validate_count("PostgreSQL", count, config.scan_rows)?;
-        if run < config.warmups {
-            warmup_ms.push(duration);
-        } else {
-            measured_ms.push(duration);
-        }
+        warmup_ms.push(duration);
+    }
+
+    for measured_index in 0..config.runs {
+        let range = measured_query_range(config, measured_index)?;
+        let started = Instant::now();
+        let count: i64 = sqlx::query_scalar(&sql)
+            .bind(range.lower_bound)
+            .bind(range.upper_bound)
+            .fetch_one(&mut *connection)
+            .await
+            .with_context(|| {
+                format!(
+                    "execute PostgreSQL measured range COUNT(*) run {}",
+                    measured_index + 1
+                )
+            })?;
+        let duration = elapsed_ms(started.elapsed());
+        observed_count = validate_count("PostgreSQL", count, config.scan_rows)?;
+        let measured = timed_query_report(
+            measured_index + 1,
+            range,
+            config.scan_rows,
+            observed_count,
+            duration,
+        );
+        print_measured_query("PostgreSQL", config.runs, &measured);
+        measured_queries.push(measured);
     }
 
     Ok(query_report(
         sql,
         explain,
+        explain_range,
         config,
         observed_count,
         warmup_ms,
-        measured_ms,
+        measured_queries,
     ))
 }
 
@@ -1555,23 +1746,31 @@ fn validate_count(database: &str, count: i64, expected: u64) -> Result<u64> {
 fn query_report(
     sql: String,
     explain: ExplainReport,
+    explain_range: QueryRange,
     config: &ResolvedConfig,
     observed_count: u64,
     warmup_ms: Vec<f64>,
-    measured_ms: Vec<f64>,
+    measured_queries: Vec<TimedRangeQueryReport>,
 ) -> QueryReport {
+    let measured_ms = measured_queries
+        .iter()
+        .map(|query| query.elapsed_ms)
+        .collect::<Vec<_>>();
     let summary_ms = summarize(&measured_ms);
     QueryReport {
         sql,
         connection_scope: "EXPLAIN, warmups, and measured runs use one acquired connection",
         explain,
+        explain_range: "first measured query range",
+        range_mode: config.query_ranges.as_str(),
         range_semantics: "event_time >= lower_bound AND event_time < upper_bound",
-        lower_bound_utc: format_utc(config.lower_bound),
-        upper_bound_utc: format_utc(config.upper_bound),
+        lower_bound_utc: format_utc(explain_range.lower_bound),
+        upper_bound_utc: format_utc(explain_range.upper_bound),
         expected_count: config.scan_rows,
         observed_count,
         warmup_ms,
         measured_ms,
+        measured_queries,
         summary_ms,
     }
 }
@@ -1696,6 +1895,7 @@ fn report_config(config: &ResolvedConfig) -> ReportConfig {
         transaction_rows: config.transaction_rows,
         warmups: config.warmups,
         measured_runs: config.runs,
+        query_ranges: config.query_ranges.as_str(),
         pool_size: config.pool_size,
         progress_every: config.progress_every,
         seed: config.seed,
@@ -1852,6 +2052,7 @@ mod tests {
             transaction_rows: 100_000,
             warmups: 2,
             runs: 5,
+            query_ranges: QueryRangeMode::Same,
             pool_size: 1,
             seed: 20_260_715,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -1862,6 +2063,33 @@ mod tests {
             output: PathBuf::from("benchmark-results/run.json"),
         })
         .expect("valid test config")
+    }
+
+    fn different_range_args() -> Args {
+        Args {
+            database: DatabaseSelection::Both,
+            mysql_url: String::new(),
+            postgres_url: String::new(),
+            table: "benchmark_events".to_owned(),
+            rows: 100,
+            scan_rows: 20,
+            skip_locked_rows: 500,
+            skip_locked_held_rows: 100,
+            range_start_row: None,
+            batch_size: 10,
+            transaction_rows: 100,
+            warmups: 0,
+            runs: 10,
+            query_ranges: QueryRangeMode::Different,
+            pool_size: 1,
+            seed: 1,
+            base_time: "2024-01-01T00:00:00Z".to_owned(),
+            progress_every: 0,
+            skip_insert: false,
+            skip_maintenance: true,
+            skip_lock_test: true,
+            output: PathBuf::from("result.json"),
+        }
     }
 
     #[test]
@@ -2005,6 +2233,44 @@ mod tests {
         assert!(report.skip_lock_test);
         assert_eq!(report.warmups, 0);
         assert_eq!(report.measured_runs, 1);
+        assert_eq!(report.query_ranges, "same");
+    }
+
+    #[test]
+    fn different_ranges_are_unique_evenly_spread_and_unwarmed() {
+        let config =
+            ResolvedConfig::from_args(different_range_args()).expect("valid different ranges");
+        let ranges = (0..config.runs)
+            .map(|index| measured_query_range(&config, index).expect("valid measured range"))
+            .collect::<Vec<_>>();
+        let starts = ranges
+            .iter()
+            .map(|range| range.start_row)
+            .collect::<Vec<_>>();
+
+        assert_eq!(starts, [0, 8, 17, 26, 35, 44, 53, 62, 71, 80]);
+        assert_eq!(
+            starts.iter().copied().collect::<HashSet<_>>().len(),
+            config.runs as usize
+        );
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.end_row - range.start_row == config.scan_rows)
+        );
+        assert_eq!(config.warmups, 0);
+    }
+
+    #[test]
+    fn different_ranges_reject_warmups() {
+        let mut args = different_range_args();
+        args.warmups = 1;
+        let error = ResolvedConfig::from_args(args).expect_err("warmups must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("--query-ranges different requires --warmups 0")
+        );
     }
 
     #[test]
@@ -2023,6 +2289,7 @@ mod tests {
             transaction_rows: 10,
             warmups: 0,
             runs: 1,
+            query_ranges: QueryRangeMode::Same,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -2054,6 +2321,7 @@ mod tests {
             transaction_rows: 10,
             warmups: 0,
             runs: 1,
+            query_ranges: QueryRangeMode::Same,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -2079,6 +2347,7 @@ mod tests {
             transaction_rows: 10,
             warmups: 0,
             runs: 1,
+            query_ranges: QueryRangeMode::Same,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),

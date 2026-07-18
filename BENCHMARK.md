@@ -90,7 +90,7 @@ CREATE INDEX idx_benchmark_events_event_time
 
 `id` 是两边的主键，由 Rust 从 1 开始连续生成并显式写入，不使用 MySQL `AUTO_INCREMENT` 或 PostgreSQL `IDENTITY`/`BIGSERIAL`。除此之外，程序还在 `event_time` 上显式创建普通 B-tree 索引。因此每张表有两个由测试定义的索引：主键索引和时间索引。
 
-包含该结构和可选只查询模式的结果 JSON 使用 `report_version=4`，并记录 `primary_key_column="id"`、`indexed_column="event_time"` 和 `explicit_indexes=2`。
+包含该结构和多范围逐次计时的结果 JSON 使用 `report_version=5`，并记录 `primary_key_column="id"`、`indexed_column="event_time"` 和 `explicit_indexes=2`。
 
 每次非 `--skip-insert` 运行都会执行 `DROP TABLE IF EXISTS`。因此只能使用专用测试数据库，不能把程序指向含有同名业务表的库。
 
@@ -195,6 +195,20 @@ runs    = 5   # 记录到 measured_ms，并生成汇总
 单次查询计时从 Rust 发起 `query_scalar` 前开始，到客户端取回并解码 `COUNT(*)` 标量后结束。连接池创建、连接获取、`EXPLAIN` 和维护不计入 `measured_ms`。每次预热和计时查询都会校验结果等于 `--scan-rows`。
 
 `summary_ms` 根据 `measured_ms` 给出 `min`、`max`、`mean`、`median` 和最近秩定义的 `p95`。样本数只有默认的 5 时，p95 实际等于最大值；解释结果时应同时查看原始数组。
+
+`--query-ranges same` 是默认模式，所有预热和正式查询都使用同一个范围。`--query-ranges different` 要求 `--warmups 0` 和至少两次正式查询；程序在 `[0, rows - scan_rows]` 上等距生成不同的起始行，第一段从 0 开始，最后一段在表尾结束，每段都精确包含 `scan_rows` 行。若 `runs * scan_rows > rows`，这些区间会重叠，但边界仍各不相同。
+
+每次正式查询都会立即输出并写入 `measured_queries`：
+
+```text
+run_number
+range_start_row / range_end_row
+lower_bound_utc / upper_bound_utc
+expected_count / observed_count
+elapsed_ms
+```
+
+为兼容已有结果处理，`measured_ms` 仍保留纯耗时数组，`summary_ms` 仍基于该数组生成；顶层 `query.lower_bound_utc`、`upper_bound_utc` 和非 `ANALYZE` `EXPLAIN` 对应第一次正式查询范围。
 
 ### 6.1 `SKIP LOCKED` 并发语义测试
 
@@ -336,6 +350,15 @@ bash scripts/linux/run-existing-query-once.sh --database mysql
 `run-existing-query-once.sh` 固定传入 `--skip-insert --skip-maintenance --skip-lock-test --warmups 0 --runs 1`。除一次非 `ANALYZE` 的 JSON `EXPLAIN` 外，每个选中的数据库只执行一次会读取数据的范围 `COUNT(*)`。它不会重启数据库或清空缓存，因此“严格冷缓存”仍取决于操作者在调用前完成上述系统级步骤。为避免编译干扰受控状态，应先构建 release 二进制，再重置缓存，最后给脚本增加 `--no-build`；测完 MySQL 后必须再次重置缓存，才能单独测 PostgreSQL。
 
 若没有预先保留的数据表，可使用 `bash scripts/linux/run-query-once.sh`。它会通过项目本地实例完成“插入全部数据 → 等待插入结束 → 零次预热 → 一次范围查询 → 自动清理测试库”的完整生命周期；由于插入过程本身会写热缓存，该结果不能称为严格冷缓存。
+
+零预热十次查询可使用：
+
+```bash
+bash scripts/linux/run-query-ten-same.sh
+bash scripts/linux/run-query-ten-different.sh
+```
+
+第一个入口固定查询同一范围十次；第二个入口固定查询十个不同的等距范围。两者都会插入数据、逐次打印耗时并在结束后自动清理测试数据库。
 
 ## 10. 结果报告模板
 
