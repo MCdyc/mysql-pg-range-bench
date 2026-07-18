@@ -78,6 +78,14 @@ struct Args {
     #[arg(long, env = "BENCH_RUNS", default_value_t = 5)]
     runs: u32,
 
+    /// Skip ANALYZE/VACUUM maintenance before the range query.
+    #[arg(long, env = "BENCH_SKIP_MAINTENANCE", default_value_t = false)]
+    skip_maintenance: bool,
+
+    /// Skip the separate concurrent SKIP LOCKED validation.
+    #[arg(long, env = "BENCH_SKIP_LOCK_TEST", default_value_t = false)]
+    skip_lock_test: bool,
+
     /// Insertion progress interval. Zero disables progress messages.
     #[arg(long, env = "BENCH_PROGRESS_EVERY", default_value_t = 1_000_000)]
     progress_every: u64,
@@ -107,6 +115,8 @@ struct Config {
     transaction_rows: u64,
     warmups: u32,
     runs: u32,
+    skip_maintenance: bool,
+    skip_lock_test: bool,
     progress_every: u64,
     output: PathBuf,
     cleanup_receipt: PathBuf,
@@ -119,14 +129,17 @@ impl Config {
             args.scan_rows > 0 && args.scan_rows <= args.rows,
             "--scan-rows must be between 1 and --rows"
         );
-        ensure!(
-            args.skip_locked_rows > 1 && args.skip_locked_rows <= args.scan_rows,
-            "--skip-locked-rows must be between 2 and --scan-rows"
-        );
-        ensure!(
-            args.skip_locked_held_rows > 0 && args.skip_locked_held_rows < args.skip_locked_rows,
-            "--skip-locked-held-rows must be between 1 and --skip-locked-rows - 1"
-        );
+        if !args.skip_lock_test {
+            ensure!(
+                args.skip_locked_rows > 1 && args.skip_locked_rows <= args.scan_rows,
+                "--skip-locked-rows must be between 2 and --scan-rows"
+            );
+            ensure!(
+                args.skip_locked_held_rows > 0
+                    && args.skip_locked_held_rows < args.skip_locked_rows,
+                "--skip-locked-held-rows must be between 1 and --skip-locked-rows - 1"
+            );
+        }
         ensure!(
             args.batch_size > 0,
             "--batch-size must be greater than zero"
@@ -159,6 +172,8 @@ impl Config {
             transaction_rows: args.transaction_rows,
             warmups: args.warmups,
             runs: args.runs,
+            skip_maintenance: args.skip_maintenance,
+            skip_lock_test: args.skip_lock_test,
             progress_every: args.progress_every,
             output: args.output,
             cleanup_receipt,
@@ -567,6 +582,11 @@ fn benchmark_command(
         )
         .env("BENCH_WARMUPS", config.warmups.to_string())
         .env("BENCH_RUNS", config.runs.to_string())
+        .env(
+            "BENCH_SKIP_MAINTENANCE",
+            config.skip_maintenance.to_string(),
+        )
+        .env("BENCH_SKIP_LOCK_TEST", config.skip_lock_test.to_string())
         .env("BENCH_PROGRESS_EVERY", config.progress_every.to_string())
         .env("BENCH_OUTPUT", &config.output);
     command
@@ -1069,6 +1089,77 @@ fn now_utc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_once_config() -> Config {
+        let args = Args::try_parse_from([
+            "linux-one-click",
+            "--mysql-admin-url",
+            "mysql://root:password@localhost:3306/mysql",
+            "--postgres-admin-url",
+            "postgres://postgres:password@localhost:5432/postgres",
+            "--rows",
+            "10",
+            "--scan-rows",
+            "1",
+            "--warmups",
+            "0",
+            "--runs",
+            "1",
+            "--skip-maintenance",
+            "--skip-lock-test",
+        ])
+        .expect("query-once lifecycle arguments should parse");
+        Config::from_args(args).expect("disabled lock test should ignore its unused range defaults")
+    }
+
+    #[test]
+    fn query_once_flags_parse_and_bypass_unused_lock_range_validation() {
+        let config = query_once_config();
+        assert_eq!(config.scan_rows, 1);
+        assert_eq!(config.warmups, 0);
+        assert_eq!(config.runs, 1);
+        assert!(config.skip_maintenance);
+        assert!(config.skip_lock_test);
+    }
+
+    #[test]
+    fn query_once_flags_are_forwarded_to_the_benchmark_child() {
+        let config = query_once_config();
+        let command = benchmark_command(
+            Path::new("mysql-pg-range-bench"),
+            &config,
+            "mysql://benchmark:password@localhost/test",
+            "postgres://benchmark:password@localhost/test",
+        );
+        let environment = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment
+                .get("BENCH_SKIP_MAINTENANCE")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            environment.get("BENCH_SKIP_LOCK_TEST").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            environment.get("BENCH_WARMUPS").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(environment.get("BENCH_RUNS").map(String::as_str), Some("1"));
+    }
 
     #[test]
     fn database_url_replaces_only_path_and_preserves_encoded_credentials_and_query() {
