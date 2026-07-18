@@ -90,6 +90,14 @@ bash scripts/linux/run-query-once.sh
 bash scripts/linux/run-query-once.sh --smoke
 ```
 
+同时采集并显示实际执行计划：
+
+```bash
+bash scripts/linux/run-query-once.sh --detailed-explain
+```
+
+正式计时查询仍然是零预热且只执行一次。详细计划在计时结束后额外执行，因此不会写入 `measured_ms`：MySQL 使用 `EXPLAIN ANALYZE FORMAT=TREE`，PostgreSQL 使用带 `ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY` 的 JSON `EXPLAIN`。终端会显示完整计划，结果 JSON 保存在 `results[].query.detailed_explain`。
+
 ## Linux 零预热十次查询
 
 插入完成后，对完全相同的时间范围连续查询十次：

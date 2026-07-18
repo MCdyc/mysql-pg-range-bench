@@ -178,6 +178,10 @@ struct Args {
     )]
     query_ranges: QueryRangeMode,
 
+    /// Execute one untimed detailed plan after measured queries and store it in JSON.
+    #[arg(long, env = "BENCH_DETAILED_EXPLAIN", default_value_t = false)]
+    detailed_explain: bool,
+
     /// Maximum database connections in each pool.
     #[arg(long, env = "BENCH_POOL_SIZE", default_value_t = 1)]
     pool_size: u32,
@@ -231,6 +235,7 @@ struct ResolvedConfig {
     warmups: u32,
     runs: u32,
     query_ranges: QueryRangeMode,
+    detailed_explain: bool,
     pool_size: u32,
     seed: u64,
     base_time: NaiveDateTime,
@@ -395,6 +400,7 @@ impl ResolvedConfig {
             warmups: args.warmups,
             runs: args.runs,
             query_ranges: args.query_ranges,
+            detailed_explain: args.detailed_explain,
             pool_size: args.pool_size,
             seed: args.seed,
             base_time,
@@ -563,6 +569,7 @@ struct ReportConfig {
     warmups: u32,
     measured_runs: u32,
     query_ranges: &'static str,
+    detailed_explain: bool,
     pool_size: u32,
     progress_every: u64,
     seed: u64,
@@ -669,6 +676,7 @@ struct QueryReport {
     sql: String,
     connection_scope: &'static str,
     explain: ExplainReport,
+    detailed_explain: Option<DetailedExplainReport>,
     explain_range: &'static str,
     range_mode: &'static str,
     range_semantics: &'static str,
@@ -724,6 +732,23 @@ struct ExplainReport {
 }
 
 #[derive(Debug, Serialize)]
+struct DetailedExplainReport {
+    sql: String,
+    format: &'static str,
+    analyze: bool,
+    buffers: bool,
+    timing_scope: &'static str,
+    execution_order: &'static str,
+    included_in_measured_ms: bool,
+    range_start_row: u64,
+    range_end_row: u64,
+    lower_bound_utc: String,
+    upper_bound_utc: String,
+    collection_elapsed_ms: f64,
+    plan: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
 struct TimingSummary {
     min: f64,
     max: f64,
@@ -741,7 +766,7 @@ async fn main() -> Result<()> {
     let started_at = Utc::now();
 
     eprintln!(
-        "benchmark: rows={}, scan_rows={}, range=[{}..{}), query_ranges={}, warmups={}, measured_runs={}, skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}, maintenance={}, lock_test={}",
+        "benchmark: rows={}, scan_rows={}, range=[{}..{}), query_ranges={}, warmups={}, measured_runs={}, detailed_explain={}, skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}, maintenance={}, lock_test={}",
         config.rows,
         config.scan_rows,
         config.range_start_row,
@@ -749,6 +774,7 @@ async fn main() -> Result<()> {
         config.query_ranges.as_str(),
         config.warmups,
         config.runs,
+        config.detailed_explain,
         config.skip_locked_rows,
         config.skip_locked_held_rows,
         config.batch_size,
@@ -840,7 +866,7 @@ async fn main() -> Result<()> {
     }
 
     let report = BenchmarkReport {
-        report_version: 5,
+        report_version: 6,
         started_at_utc: format_utc(started_at.naive_utc()),
         finished_at_utc: format_utc(Utc::now().naive_utc()),
         config: report_config(&config),
@@ -1260,6 +1286,47 @@ fn print_measured_query(database: &str, total_runs: u32, query: &TimedRangeQuery
     );
 }
 
+fn detailed_explain_report(
+    sql: String,
+    format: &'static str,
+    buffers: bool,
+    range: QueryRange,
+    collection_elapsed_ms: f64,
+    plan: serde_json::Value,
+) -> DetailedExplainReport {
+    DetailedExplainReport {
+        sql,
+        format,
+        analyze: true,
+        buffers,
+        timing_scope: "wall-clock time to execute EXPLAIN ANALYZE and receive its plan; excluded from measured query timings",
+        execution_order: "after all warmups and measured queries on the same acquired connection",
+        included_in_measured_ms: false,
+        range_start_row: range.start_row,
+        range_end_row: range.end_row,
+        lower_bound_utc: format_utc(range.lower_bound),
+        upper_bound_utc: format_utc(range.upper_bound),
+        collection_elapsed_ms,
+        plan,
+    }
+}
+
+fn print_detailed_explain(database: &str, report: &DetailedExplainReport) -> Result<()> {
+    eprintln!(
+        "{database} detailed EXPLAIN ANALYZE: rows=[{}..{}), collection_elapsed_ms={:.3}",
+        report.range_start_row, report.range_end_row, report.collection_elapsed_ms
+    );
+    match &report.plan {
+        serde_json::Value::String(plan) => eprintln!("{plan}"),
+        plan => eprintln!(
+            "{}",
+            serde_json::to_string_pretty(plan)
+                .context("serialize detailed EXPLAIN plan for console output")?
+        ),
+    }
+    Ok(())
+}
+
 async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Result<QueryReport> {
     let sql = format!(
         "SELECT COUNT(*) FROM {} WHERE event_time >= ? AND event_time < ?",
@@ -1287,7 +1354,6 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
     };
     let mut warmup_ms = Vec::with_capacity(config.warmups as usize);
     let mut measured_queries = Vec::with_capacity(config.runs as usize);
-    let mut observed_count = 0_u64;
 
     for _ in 0..config.warmups {
         let started = Instant::now();
@@ -1298,7 +1364,7 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
             .await
             .context("execute MySQL range COUNT(*)")?;
         let duration = elapsed_ms(started.elapsed());
-        observed_count = validate_count("MySQL", count, config.scan_rows)?;
+        validate_count("MySQL", count, config.scan_rows)?;
         warmup_ms.push(duration);
     }
 
@@ -1317,7 +1383,7 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
                 )
             })?;
         let duration = elapsed_ms(started.elapsed());
-        observed_count = validate_count("MySQL", count, config.scan_rows)?;
+        let observed_count = validate_count("MySQL", count, config.scan_rows)?;
         let measured = timed_query_report(
             measured_index + 1,
             range,
@@ -1329,12 +1395,35 @@ async fn benchmark_mysql_query(pool: &MySqlPool, config: &ResolvedConfig) -> Res
         measured_queries.push(measured);
     }
 
+    let detailed_explain = if config.detailed_explain {
+        let detailed_sql = format!("EXPLAIN ANALYZE FORMAT=TREE {sql}");
+        let started = Instant::now();
+        let plan: String = sqlx::query_scalar(&detailed_sql)
+            .bind(explain_range.lower_bound)
+            .bind(explain_range.upper_bound)
+            .fetch_one(&mut *connection)
+            .await
+            .context("EXPLAIN ANALYZE MySQL range COUNT(*)")?;
+        let report = detailed_explain_report(
+            detailed_sql,
+            "tree",
+            false,
+            explain_range,
+            elapsed_ms(started.elapsed()),
+            serde_json::Value::String(plan),
+        );
+        print_detailed_explain("MySQL", &report)?;
+        Some(report)
+    } else {
+        None
+    };
+
     Ok(query_report(
         sql,
         explain,
+        detailed_explain,
         explain_range,
         config,
-        observed_count,
         warmup_ms,
         measured_queries,
     ))
@@ -1364,7 +1453,6 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
     };
     let mut warmup_ms = Vec::with_capacity(config.warmups as usize);
     let mut measured_queries = Vec::with_capacity(config.runs as usize);
-    let mut observed_count = 0_u64;
 
     for _ in 0..config.warmups {
         let started = Instant::now();
@@ -1375,7 +1463,7 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
             .await
             .context("execute PostgreSQL range COUNT(*)")?;
         let duration = elapsed_ms(started.elapsed());
-        observed_count = validate_count("PostgreSQL", count, config.scan_rows)?;
+        validate_count("PostgreSQL", count, config.scan_rows)?;
         warmup_ms.push(duration);
     }
 
@@ -1394,7 +1482,7 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
                 )
             })?;
         let duration = elapsed_ms(started.elapsed());
-        observed_count = validate_count("PostgreSQL", count, config.scan_rows)?;
+        let observed_count = validate_count("PostgreSQL", count, config.scan_rows)?;
         let measured = timed_query_report(
             measured_index + 1,
             range,
@@ -1406,12 +1494,36 @@ async fn benchmark_postgres_query(pool: &PgPool, config: &ResolvedConfig) -> Res
         measured_queries.push(measured);
     }
 
+    let detailed_explain = if config.detailed_explain {
+        let detailed_sql =
+            format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY, FORMAT JSON) {sql}");
+        let started = Instant::now();
+        let plan: serde_json::Value = sqlx::query_scalar(&detailed_sql)
+            .bind(explain_range.lower_bound)
+            .bind(explain_range.upper_bound)
+            .fetch_one(&mut *connection)
+            .await
+            .context("EXPLAIN ANALYZE BUFFERS PostgreSQL range COUNT(*)")?;
+        let report = detailed_explain_report(
+            detailed_sql,
+            "json",
+            true,
+            explain_range,
+            elapsed_ms(started.elapsed()),
+            plan,
+        );
+        print_detailed_explain("PostgreSQL", &report)?;
+        Some(report)
+    } else {
+        None
+    };
+
     Ok(query_report(
         sql,
         explain,
+        detailed_explain,
         explain_range,
         config,
-        observed_count,
         warmup_ms,
         measured_queries,
     ))
@@ -1746,12 +1858,16 @@ fn validate_count(database: &str, count: i64, expected: u64) -> Result<u64> {
 fn query_report(
     sql: String,
     explain: ExplainReport,
+    detailed_explain: Option<DetailedExplainReport>,
     explain_range: QueryRange,
     config: &ResolvedConfig,
-    observed_count: u64,
     warmup_ms: Vec<f64>,
     measured_queries: Vec<TimedRangeQueryReport>,
 ) -> QueryReport {
+    let observed_count = measured_queries
+        .last()
+        .map(|query| query.observed_count)
+        .expect("validated configuration always executes at least one measured query");
     let measured_ms = measured_queries
         .iter()
         .map(|query| query.elapsed_ms)
@@ -1759,8 +1875,9 @@ fn query_report(
     let summary_ms = summarize(&measured_ms);
     QueryReport {
         sql,
-        connection_scope: "EXPLAIN, warmups, and measured runs use one acquired connection",
+        connection_scope: "EXPLAIN, warmups, measured runs, and optional detailed EXPLAIN ANALYZE use one acquired connection",
         explain,
+        detailed_explain,
         explain_range: "first measured query range",
         range_mode: config.query_ranges.as_str(),
         range_semantics: "event_time >= lower_bound AND event_time < upper_bound",
@@ -1896,6 +2013,7 @@ fn report_config(config: &ResolvedConfig) -> ReportConfig {
         warmups: config.warmups,
         measured_runs: config.runs,
         query_ranges: config.query_ranges.as_str(),
+        detailed_explain: config.detailed_explain,
         pool_size: config.pool_size,
         progress_every: config.progress_every,
         seed: config.seed,
@@ -2053,6 +2171,7 @@ mod tests {
             warmups: 2,
             runs: 5,
             query_ranges: QueryRangeMode::Same,
+            detailed_explain: false,
             pool_size: 1,
             seed: 20_260_715,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -2081,6 +2200,7 @@ mod tests {
             warmups: 0,
             runs: 10,
             query_ranges: QueryRangeMode::Different,
+            detailed_explain: false,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -2226,6 +2346,7 @@ mod tests {
         config.skip_lock_test = true;
         config.warmups = 0;
         config.runs = 1;
+        config.detailed_explain = true;
 
         let report = report_config(&config);
         assert!(report.skip_insert);
@@ -2234,6 +2355,36 @@ mod tests {
         assert_eq!(report.warmups, 0);
         assert_eq!(report.measured_runs, 1);
         assert_eq!(report.query_ranges, "same");
+        assert!(report.detailed_explain);
+    }
+
+    #[test]
+    fn detailed_explain_metadata_marks_the_extra_execution_as_untimed_and_after_measurements() {
+        let config = test_config();
+        let range = measured_query_range(&config, 0).expect("first measured range");
+        let report = detailed_explain_report(
+            "EXPLAIN ANALYZE SELECT COUNT(*)".to_owned(),
+            "tree",
+            false,
+            range,
+            12.5,
+            serde_json::Value::String("actual plan".to_owned()),
+        );
+
+        assert!(report.analyze);
+        assert!(!report.buffers);
+        assert!(!report.included_in_measured_ms);
+        assert_eq!(report.range_start_row, config.range_start_row);
+        assert_eq!(
+            report.range_end_row,
+            config.range_start_row + config.scan_rows
+        );
+        assert_eq!(report.collection_elapsed_ms, 12.5);
+        assert!(
+            report
+                .execution_order
+                .contains("after all warmups and measured queries")
+        );
     }
 
     #[test]
@@ -2290,6 +2441,7 @@ mod tests {
             warmups: 0,
             runs: 1,
             query_ranges: QueryRangeMode::Same,
+            detailed_explain: false,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -2322,6 +2474,7 @@ mod tests {
             warmups: 0,
             runs: 1,
             query_ranges: QueryRangeMode::Same,
+            detailed_explain: false,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),
@@ -2348,6 +2501,7 @@ mod tests {
             warmups: 0,
             runs: 1,
             query_ranges: QueryRangeMode::Same,
+            detailed_explain: false,
             pool_size: 1,
             seed: 1,
             base_time: "2024-01-01T00:00:00Z".to_owned(),

@@ -102,6 +102,10 @@ struct Args {
     )]
     query_ranges: QueryRangeMode,
 
+    /// Execute one untimed detailed plan after measured queries and store it in JSON.
+    #[arg(long, env = "BENCH_DETAILED_EXPLAIN", default_value_t = false)]
+    detailed_explain: bool,
+
     /// Skip ANALYZE/VACUUM maintenance before the range query.
     #[arg(long, env = "BENCH_SKIP_MAINTENANCE", default_value_t = false)]
     skip_maintenance: bool,
@@ -140,6 +144,7 @@ struct Config {
     warmups: u32,
     runs: u32,
     query_ranges: QueryRangeMode,
+    detailed_explain: bool,
     skip_maintenance: bool,
     skip_lock_test: bool,
     progress_every: u64,
@@ -215,6 +220,7 @@ impl Config {
             warmups: args.warmups,
             runs: args.runs,
             query_ranges: args.query_ranges,
+            detailed_explain: args.detailed_explain,
             skip_maintenance: args.skip_maintenance,
             skip_lock_test: args.skip_lock_test,
             progress_every: args.progress_every,
@@ -626,6 +632,10 @@ fn benchmark_command(
         .env("BENCH_WARMUPS", config.warmups.to_string())
         .env("BENCH_RUNS", config.runs.to_string())
         .env("BENCH_QUERY_RANGES", config.query_ranges.as_str())
+        .env(
+            "BENCH_DETAILED_EXPLAIN",
+            config.detailed_explain.to_string(),
+        )
         .env(
             "BENCH_SKIP_MAINTENANCE",
             config.skip_maintenance.to_string(),
@@ -1149,6 +1159,7 @@ mod tests {
             "0",
             "--runs",
             "1",
+            "--detailed-explain",
             "--skip-maintenance",
             "--skip-lock-test",
         ])
@@ -1186,6 +1197,7 @@ mod tests {
         assert_eq!(config.scan_rows, 1);
         assert_eq!(config.warmups, 0);
         assert_eq!(config.runs, 1);
+        assert!(config.detailed_explain);
         assert!(config.skip_maintenance);
         assert!(config.skip_lock_test);
     }
@@ -1230,6 +1242,12 @@ mod tests {
         assert_eq!(
             environment.get("BENCH_QUERY_RANGES").map(String::as_str),
             Some("same")
+        );
+        assert_eq!(
+            environment
+                .get("BENCH_DETAILED_EXPLAIN")
+                .map(String::as_str),
+            Some("true")
         );
     }
 

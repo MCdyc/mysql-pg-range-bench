@@ -27,6 +27,12 @@ Defaults:
 Smoke example:
   bash scripts/linux/run-query-once.sh --smoke
 
+Detailed actual-plan example:
+  bash scripts/linux/run-query-once.sh --detailed-explain
+
+The detailed plan runs after the measured query, is printed to the terminal,
+and is stored in query.detailed_explain without changing measured_ms.
+
 All non-reserved options are forwarded to run-one-click.sh. The fixed
 single-query settings cannot be overridden.
 USAGE

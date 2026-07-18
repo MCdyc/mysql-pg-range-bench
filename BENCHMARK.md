@@ -90,7 +90,7 @@ CREATE INDEX idx_benchmark_events_event_time
 
 `id` 是两边的主键，由 Rust 从 1 开始连续生成并显式写入，不使用 MySQL `AUTO_INCREMENT` 或 PostgreSQL `IDENTITY`/`BIGSERIAL`。除此之外，程序还在 `event_time` 上显式创建普通 B-tree 索引。因此每张表有两个由测试定义的索引：主键索引和时间索引。
 
-包含该结构和多范围逐次计时的结果 JSON 使用 `report_version=5`，并记录 `primary_key_column="id"`、`indexed_column="event_time"` 和 `explicit_indexes=2`。
+包含该结构、多范围逐次计时和可选实际执行计划的结果 JSON 使用 `report_version=6`，并记录 `primary_key_column="id"`、`indexed_column="event_time"` 和 `explicit_indexes=2`。
 
 每次非 `--skip-insert` 运行都会执行 `DROP TABLE IF EXISTS`。因此只能使用专用测试数据库，不能把程序指向含有同名业务表的库。
 
@@ -209,6 +209,13 @@ elapsed_ms
 ```
 
 为兼容已有结果处理，`measured_ms` 仍保留纯耗时数组，`summary_ms` 仍基于该数组生成；顶层 `query.lower_bound_utc`、`upper_bound_utc` 和非 `ANALYZE` `EXPLAIN` 对应第一次正式查询范围。
+
+使用 `--detailed-explain` 时，Rust 在全部预热和正式计时查询结束后，使用同一连接和第一次正式查询的范围额外执行一次实际计划：
+
+- MySQL：`EXPLAIN ANALYZE FORMAT=TREE`，树形文本写入 `query.detailed_explain.plan`。
+- PostgreSQL：`EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY, FORMAT JSON)`，结构化计划写入同一字段。
+
+`query.detailed_explain` 还记录范围、采集耗时、格式、是否包含 buffer 统计和执行顺序。该额外执行会读取数据并显示在终端，但固定发生在正式查询之后，`included_in_measured_ms=false`，不会改变 `measured_ms` 或汇总。未启用时该字段为 `null`。
 
 ### 6.1 `SKIP LOCKED` 并发语义测试
 
@@ -350,6 +357,14 @@ bash scripts/linux/run-existing-query-once.sh --database mysql
 `run-existing-query-once.sh` 固定传入 `--skip-insert --skip-maintenance --skip-lock-test --warmups 0 --runs 1`。除一次非 `ANALYZE` 的 JSON `EXPLAIN` 外，每个选中的数据库只执行一次会读取数据的范围 `COUNT(*)`。它不会重启数据库或清空缓存，因此“严格冷缓存”仍取决于操作者在调用前完成上述系统级步骤。为避免编译干扰受控状态，应先构建 release 二进制，再重置缓存，最后给脚本增加 `--no-build`；测完 MySQL 后必须再次重置缓存，才能单独测 PostgreSQL。
 
 若没有预先保留的数据表，可使用 `bash scripts/linux/run-query-once.sh`。它会通过项目本地实例完成“插入全部数据 → 等待插入结束 → 零次预热 → 一次范围查询 → 自动清理测试库”的完整生命周期；由于插入过程本身会写热缓存，该结果不能称为严格冷缓存。
+
+若还要在清理前采集实际行数、执行耗时、PostgreSQL `Heap Fetches` 和 buffer 命中/读取情况，可执行：
+
+```bash
+bash scripts/linux/run-query-once.sh --detailed-explain
+```
+
+详细计划在唯一一次正式计时查询之后额外执行并写入 JSON，因此正式计时本身仍无预热。
 
 零预热十次查询可使用：
 
