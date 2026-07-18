@@ -54,7 +54,7 @@ while (( $# > 0 )); do
     esac
 done
 
-exec "${ONE_CLICK_SCRIPT}" \
+exec bash "${ONE_CLICK_SCRIPT}" \
     --skip-maintenance \
     --skip-lock-test \
     --warmups 0 \
