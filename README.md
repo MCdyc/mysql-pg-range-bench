@@ -76,6 +76,32 @@ bash scripts/linux/delete-local-instances.sh
 
 如确实需要连接已有整机数据库，必须显式使用 `scripts/linux/run-existing-one-click.sh`；其边界见 [LINUX_EXISTING_DATABASES.md](LINUX_EXISTING_DATABASES.md)。
 
+## Linux 一键插入后单次查询
+
+下面的入口会使用项目本地实例插入完整数据，等待插入完成，不执行维护和预热，只执行一次范围 `COUNT(*)`，随后自动清理测试数据库并保留实例：
+
+```bash
+bash scripts/linux/run-query-once.sh
+```
+
+小规模验证：
+
+```bash
+bash scripts/linux/run-query-once.sh --smoke
+```
+
+## Linux 已有数据只读单次查询
+
+如果数据库中已经保留了符合本项目 schema 和确定性时间规则的 `benchmark_events` 表，可用只读脚本测量一次范围查询：
+
+```bash
+MYSQL_URL='mysql://用户:URL编码密码@127.0.0.1:3306/benchmark' \
+POSTGRES_URL='postgres://用户:URL编码密码@127.0.0.1:5432/benchmark' \
+bash scripts/linux/run-existing-query-once.sh
+```
+
+该脚本固定执行零次预热和一次正式 `COUNT(*)`，并跳过插入、`ANALYZE/VACUUM` 和 `SKIP LOCKED`。它不会创建、修改或删除数据库对象，也不会管理数据库或 Linux 页缓存。严格冷缓存测试应先执行 `cargo build --release --locked --bin mysql-pg-range-bench`，再完成数据库重启与 OS 页缓存控制，最后使用 `run-existing-query-once.sh --no-build --database mysql`；测另一个数据库前必须重新重置缓存。
+
 ## 建议的正式测试方式
 
 1. 固定 CPU、内存、磁盘、镜像版本和数据库配置，不要在测试期间运行其他重负载。

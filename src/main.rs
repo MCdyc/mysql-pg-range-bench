@@ -174,6 +174,14 @@ struct Args {
     #[arg(long, env = "BENCH_SKIP_INSERT", default_value_t = false)]
     skip_insert: bool,
 
+    /// Skip ANALYZE/VACUUM maintenance before the range query.
+    #[arg(long, env = "BENCH_SKIP_MAINTENANCE", default_value_t = false)]
+    skip_maintenance: bool,
+
+    /// Skip the separate concurrent SKIP LOCKED validation.
+    #[arg(long, env = "BENCH_SKIP_LOCK_TEST", default_value_t = false)]
+    skip_lock_test: bool,
+
     /// Structured JSON result destination.
     #[arg(
         long,
@@ -206,6 +214,8 @@ struct ResolvedConfig {
     skip_locked_upper_bound: NaiveDateTime,
     progress_every: u64,
     skip_insert: bool,
+    skip_maintenance: bool,
+    skip_lock_test: bool,
     output: PathBuf,
 }
 
@@ -224,20 +234,23 @@ impl ResolvedConfig {
             args.scan_rows,
             args.rows
         );
-        ensure!(
-            args.skip_locked_rows > 1,
-            "--skip-locked-rows must be greater than one"
-        );
-        ensure!(
-            args.skip_locked_rows <= args.scan_rows,
-            "--skip-locked-rows ({}) cannot exceed --scan-rows ({})",
-            args.skip_locked_rows,
-            args.scan_rows
-        );
-        ensure!(
-            args.skip_locked_held_rows > 0 && args.skip_locked_held_rows < args.skip_locked_rows,
-            "--skip-locked-held-rows must be between 1 and --skip-locked-rows - 1"
-        );
+        if !args.skip_lock_test {
+            ensure!(
+                args.skip_locked_rows > 1,
+                "--skip-locked-rows must be greater than one"
+            );
+            ensure!(
+                args.skip_locked_rows <= args.scan_rows,
+                "--skip-locked-rows ({}) cannot exceed --scan-rows ({})",
+                args.skip_locked_rows,
+                args.scan_rows
+            );
+            ensure!(
+                args.skip_locked_held_rows > 0
+                    && args.skip_locked_held_rows < args.skip_locked_rows,
+                "--skip-locked-held-rows must be between 1 and --skip-locked-rows - 1"
+            );
+        }
         ensure!(
             args.batch_size > 0,
             "--batch-size must be greater than zero"
@@ -302,10 +315,14 @@ impl ResolvedConfig {
         let final_event_time = event_time_at(base_time, args.rows - 1)?;
         let lower_bound = event_time_at(base_time, range_start_row)?;
         let upper_bound = event_time_at(base_time, range_end_row)?;
-        let skip_locked_end_row = range_start_row
-            .checked_add(args.skip_locked_rows)
-            .context("SKIP LOCKED range row numbers overflowed u64")?;
-        let skip_locked_upper_bound = event_time_at(base_time, skip_locked_end_row)?;
+        let skip_locked_upper_bound = if args.skip_lock_test {
+            lower_bound
+        } else {
+            let skip_locked_end_row = range_start_row
+                .checked_add(args.skip_locked_rows)
+                .context("SKIP LOCKED range row numbers overflowed u64")?;
+            event_time_at(base_time, skip_locked_end_row)?
+        };
         ensure!(
             base_time.year() >= 1000
                 && final_event_time.year() <= 9999
@@ -336,6 +353,8 @@ impl ResolvedConfig {
             skip_locked_upper_bound,
             progress_every: args.progress_every,
             skip_insert: args.skip_insert,
+            skip_maintenance: args.skip_maintenance,
+            skip_lock_test: args.skip_lock_test,
             output: args.output,
         })
     }
@@ -498,6 +517,8 @@ struct ReportConfig {
     seed: u64,
     base_time_utc: String,
     skip_insert: bool,
+    skip_maintenance: bool,
+    skip_lock_test: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -573,9 +594,9 @@ struct DatabaseReport {
     server_version: String,
     schema_setup_ms: Option<f64>,
     insert: Option<InsertReport>,
-    analyze_ms: f64,
+    analyze_ms: Option<f64>,
     query: QueryReport,
-    skip_locked: SkipLockedReport,
+    skip_locked: Option<SkipLockedReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -654,7 +675,7 @@ async fn main() -> Result<()> {
     let started_at = Utc::now();
 
     eprintln!(
-        "benchmark: rows={}, scan_rows={}, range=[{}..{}), skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}",
+        "benchmark: rows={}, scan_rows={}, range=[{}..{}), skip_locked_rows={}, skip_locked_held_rows={}, batch_size={}, transaction_rows={}, maintenance={}, lock_test={}",
         config.rows,
         config.scan_rows,
         config.range_start_row,
@@ -662,7 +683,9 @@ async fn main() -> Result<()> {
         config.skip_locked_rows,
         config.skip_locked_held_rows,
         config.batch_size,
-        config.transaction_rows
+        config.transaction_rows,
+        !config.skip_maintenance,
+        !config.skip_lock_test
     );
 
     // Establish every requested connection before starting a potentially long insert.
@@ -748,7 +771,7 @@ async fn main() -> Result<()> {
     }
 
     let report = BenchmarkReport {
-        report_version: 3,
+        report_version: 4,
         started_at_utc: format_utc(started_at.naive_utc()),
         finished_at_utc: format_utc(Utc::now().naive_utc()),
         config: report_config(&config),
@@ -778,16 +801,24 @@ async fn run_mysql(pool: &MySqlPool, config: &ResolvedConfig) -> Result<Database
         (Some(schema_ms), Some(inserted))
     };
 
-    let analyze_started = Instant::now();
-    let analyze_sql = format!("ANALYZE TABLE {}", mysql_identifier(&config.table));
-    sqlx::query(&analyze_sql)
-        .fetch_all(pool)
-        .await
-        .context("ANALYZE MySQL table")?;
-    let analyze_ms = elapsed_ms(analyze_started.elapsed());
+    let analyze_ms = if config.skip_maintenance {
+        None
+    } else {
+        let analyze_started = Instant::now();
+        let analyze_sql = format!("ANALYZE TABLE {}", mysql_identifier(&config.table));
+        sqlx::query(&analyze_sql)
+            .fetch_all(pool)
+            .await
+            .context("ANALYZE MySQL table")?;
+        Some(elapsed_ms(analyze_started.elapsed()))
+    };
 
     let query = benchmark_mysql_query(pool, config).await?;
-    let skip_locked = benchmark_mysql_skip_locked(config).await?;
+    let skip_locked = if config.skip_lock_test {
+        None
+    } else {
+        Some(benchmark_mysql_skip_locked(config).await?)
+    };
     Ok(DatabaseReport {
         database: "mysql",
         server_version: version,
@@ -816,16 +847,24 @@ async fn run_postgres(pool: &PgPool, config: &ResolvedConfig) -> Result<Database
         (Some(schema_ms), Some(inserted))
     };
 
-    let analyze_started = Instant::now();
-    // VACUUM sets visibility-map bits, allowing a fair index-only COUNT(*) after bulk load.
-    let vacuum_sql = format!("VACUUM (ANALYZE) {}", postgres_identifier(&config.table));
-    pool.execute(vacuum_sql.as_str())
-        .await
-        .context("VACUUM ANALYZE PostgreSQL table")?;
-    let analyze_ms = elapsed_ms(analyze_started.elapsed());
+    let analyze_ms = if config.skip_maintenance {
+        None
+    } else {
+        let analyze_started = Instant::now();
+        // VACUUM sets visibility-map bits, allowing a fair index-only COUNT(*) after bulk load.
+        let vacuum_sql = format!("VACUUM (ANALYZE) {}", postgres_identifier(&config.table));
+        pool.execute(vacuum_sql.as_str())
+            .await
+            .context("VACUUM ANALYZE PostgreSQL table")?;
+        Some(elapsed_ms(analyze_started.elapsed()))
+    };
 
     let query = benchmark_postgres_query(pool, config).await?;
-    let skip_locked = benchmark_postgres_skip_locked(config).await?;
+    let skip_locked = if config.skip_lock_test {
+        None
+    } else {
+        Some(benchmark_postgres_skip_locked(config).await?)
+    };
     Ok(DatabaseReport {
         database: "postgres",
         server_version: version,
@@ -1629,15 +1668,19 @@ fn print_console_summary(report: &DatabaseReport) {
         report.query.summary_ms.p95,
         report.query.summary_ms.max
     );
-    eprintln!(
-        "{} summary: SKIP LOCKED candidates={}, held={}, returned={}, query ms={:.3}, event_time_index_used={}",
-        report.database,
-        report.skip_locked.candidate_rows_observed,
-        report.skip_locked.held_rows_observed,
-        report.skip_locked.returned_rows_observed,
-        report.skip_locked.elapsed_ms,
-        report.skip_locked.explain_uses_expected_index
-    );
+    if let Some(skip_locked) = report.skip_locked.as_ref() {
+        eprintln!(
+            "{} summary: SKIP LOCKED candidates={}, held={}, returned={}, query ms={:.3}, event_time_index_used={}",
+            report.database,
+            skip_locked.candidate_rows_observed,
+            skip_locked.held_rows_observed,
+            skip_locked.returned_rows_observed,
+            skip_locked.elapsed_ms,
+            skip_locked.explain_uses_expected_index
+        );
+    } else {
+        eprintln!("{} summary: SKIP LOCKED skipped", report.database);
+    }
 }
 
 fn report_config(config: &ResolvedConfig) -> ReportConfig {
@@ -1658,6 +1701,8 @@ fn report_config(config: &ResolvedConfig) -> ReportConfig {
         seed: config.seed,
         base_time_utc: format_utc(config.base_time),
         skip_insert: config.skip_insert,
+        skip_maintenance: config.skip_maintenance,
+        skip_lock_test: config.skip_lock_test,
     }
 }
 
@@ -1812,6 +1857,8 @@ mod tests {
             base_time: "2024-01-01T00:00:00Z".to_owned(),
             progress_every: 1_000_000,
             skip_insert: false,
+            skip_maintenance: false,
+            skip_lock_test: false,
             output: PathBuf::from("benchmark-results/run.json"),
         })
         .expect("valid test config")
@@ -1944,6 +1991,54 @@ mod tests {
     }
 
     #[test]
+    fn query_once_mode_is_recorded_without_warmups_or_extra_work() {
+        let mut config = test_config();
+        config.skip_insert = true;
+        config.skip_maintenance = true;
+        config.skip_lock_test = true;
+        config.warmups = 0;
+        config.runs = 1;
+
+        let report = report_config(&config);
+        assert!(report.skip_insert);
+        assert!(report.skip_maintenance);
+        assert!(report.skip_lock_test);
+        assert_eq!(report.warmups, 0);
+        assert_eq!(report.measured_runs, 1);
+    }
+
+    #[test]
+    fn skipped_lock_test_does_not_limit_a_smaller_query_range() {
+        let config = ResolvedConfig::from_args(Args {
+            database: DatabaseSelection::Both,
+            mysql_url: String::new(),
+            postgres_url: String::new(),
+            table: "benchmark_events".to_owned(),
+            rows: 10,
+            scan_rows: 1,
+            skip_locked_rows: 500,
+            skip_locked_held_rows: 100,
+            range_start_row: None,
+            batch_size: 10,
+            transaction_rows: 10,
+            warmups: 0,
+            runs: 1,
+            pool_size: 1,
+            seed: 1,
+            base_time: "2024-01-01T00:00:00Z".to_owned(),
+            progress_every: 0,
+            skip_insert: true,
+            skip_maintenance: true,
+            skip_lock_test: true,
+            output: PathBuf::from("result.json"),
+        })
+        .expect("disabled lock test should ignore its unused range parameters");
+
+        assert_eq!(config.scan_rows, 1);
+        assert_eq!(config.skip_locked_upper_bound, config.lower_bound);
+    }
+
+    #[test]
     fn batch_size_respects_cross_database_parameter_limit() {
         let mut args = Args {
             database: DatabaseSelection::Both,
@@ -1964,6 +2059,8 @@ mod tests {
             base_time: "2024-01-01T00:00:00Z".to_owned(),
             progress_every: 0,
             skip_insert: false,
+            skip_maintenance: false,
+            skip_lock_test: false,
             output: PathBuf::from("result.json"),
         };
         assert!(ResolvedConfig::from_args(args).is_err());
@@ -1987,6 +2084,8 @@ mod tests {
             base_time: "2024-01-01T00:00:00Z".to_owned(),
             progress_every: 0,
             skip_insert: false,
+            skip_maintenance: false,
+            skip_lock_test: false,
             output: PathBuf::from("result.json"),
         };
         assert!(ResolvedConfig::from_args(args).is_ok());
