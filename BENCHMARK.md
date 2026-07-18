@@ -90,7 +90,7 @@ CREATE INDEX idx_benchmark_events_event_time
 
 `id` 是两边的主键，由 Rust 从 1 开始连续生成并显式写入，不使用 MySQL `AUTO_INCREMENT` 或 PostgreSQL `IDENTITY`/`BIGSERIAL`。除此之外，程序还在 `event_time` 上显式创建普通 B-tree 索引。因此每张表有两个由测试定义的索引：主键索引和时间索引。
 
-包含该结构的结果 JSON 使用 `report_version=3`，并记录 `primary_key_column="id"`、`indexed_column="event_time"` 和 `explicit_indexes=2`。
+包含该结构和可选只查询模式的结果 JSON 使用 `report_version=4`，并记录 `primary_key_column="id"`、`indexed_column="event_time"` 和 `explicit_indexes=2`。
 
 每次非 `--skip-insert` 运行都会执行 `DROP TABLE IF EXISTS`。因此只能使用专用测试数据库，不能把程序指向含有同名业务表的库。
 
@@ -177,7 +177,7 @@ transaction_rows = 100,000 行/事务
 - 网络往返、数据库写入、预建时间索引维护；
 - 所有事务的 `BEGIN`/`COMMIT`。
 
-连接建立、服务器版本读取、`DROP/CREATE TABLE`、创建索引以及插入后的统计信息维护不在 `insert.elapsed_ms` 中。删除旧表、建表和建索引合计记录为 `schema_setup_ms`；MySQL `ANALYZE TABLE` 或 PostgreSQL `VACUUM (ANALYZE)` 单独记录为 `analyze_ms`。
+连接建立、服务器版本读取、`DROP/CREATE TABLE`、创建索引以及插入后的统计信息维护不在 `insert.elapsed_ms` 中。删除旧表、建表和建索引合计记录为 `schema_setup_ms`；MySQL `ANALYZE TABLE` 或 PostgreSQL `VACUUM (ANALYZE)` 单独记录为 `analyze_ms`。使用 `--skip-maintenance` 时 `analyze_ms` 为 `null`。
 
 进度输出发生在插入计时区间内。JSON 会记录 `progress_every` 和 `includes_progress_logging=true`；对比不同轮次时必须保持相同输出频率，或统一使用 `--progress-every 0`。
 
@@ -238,7 +238,7 @@ expected_returned     = 400
   -> 比较两次生成指纹 -> 写一个 JSON 文件
 ```
 
-`--skip-insert` 会跳过删表、建表、建索引和插入，但仍会执行维护、范围查询与 `SKIP LOCKED` 校验。使用它时，现有表必须具有本文的确切 15 列 schema、`id` 主键和显式时间索引，并与本次参数相匹配。程序会通过两个范围计数、`SKIP LOCKED` 返回行和执行计划发现部分不匹配，但不会回读校验全部字段、主键或系统目录；因此 JSON 会把 `schema_status` 标为 expected/unverified，并把索引数量及“插入前已创建”状态写为 `null`。
+`--skip-insert` 会跳过删表、建表、建索引和插入，但默认仍执行维护、范围查询与 `SKIP LOCKED` 校验。`--skip-maintenance` 可跳过 MySQL `ANALYZE TABLE` 和 PostgreSQL `VACUUM (ANALYZE)`；`--skip-lock-test` 可跳过独立的 `SKIP LOCKED` 校验。使用现有表时，它必须具有本文的确切 15 列 schema、`id` 主键和显式时间索引，并与本次参数相匹配。程序不会回读校验全部字段、主键或系统目录；因此 JSON 会把 `schema_status` 标为 expected/unverified，并把未知的索引创建状态写为 `null`。跳过的维护耗时和锁测试结果也分别写为 `null`。
 
 ## 7. Linux 运行示例
 
@@ -325,7 +325,17 @@ export POSTGRES_URL='postgres://用户:URL编码密码@127.0.0.1:5432/benchmark'
 
 只重启数据库不会清空 Linux 页缓存。清空页缓存是整机操作，只能在专用机器上进行；没有权限时应标记为“数据库重启、OS 缓存未知”，不能称为严格冷缓存。
 
-还要注意，当前 `--skip-insert` 仍会在查询前执行 `ANALYZE TABLE` 或 `VACUUM (ANALYZE)`，可能重新预热数据或索引。因此它不能直接充当严格冷缓存的“只查询”入口。若要严格按上述流程用 Rust 计时，需要另行提供一个跳过维护的查询入口或独立查询程序，并把它明确列为不同于当前默认流程的实验工具。
+已有数据可通过下面的只读入口执行零次预热、一次正式范围查询：
+
+```bash
+MYSQL_URL='mysql://用户:URL编码密码@127.0.0.1:3306/benchmark' \
+POSTGRES_URL='postgres://用户:URL编码密码@127.0.0.1:5432/benchmark' \
+bash scripts/linux/run-existing-query-once.sh --database mysql
+```
+
+`run-existing-query-once.sh` 固定传入 `--skip-insert --skip-maintenance --skip-lock-test --warmups 0 --runs 1`。除一次非 `ANALYZE` 的 JSON `EXPLAIN` 外，每个选中的数据库只执行一次会读取数据的范围 `COUNT(*)`。它不会重启数据库或清空缓存，因此“严格冷缓存”仍取决于操作者在调用前完成上述系统级步骤。为避免编译干扰受控状态，应先构建 release 二进制，再重置缓存，最后给脚本增加 `--no-build`；测完 MySQL 后必须再次重置缓存，才能单独测 PostgreSQL。
+
+若没有预先保留的数据表，可使用 `bash scripts/linux/run-query-once.sh`。它会通过项目本地实例完成“插入全部数据 → 等待插入结束 → 零次预热 → 一次范围查询 → 自动清理测试库”的完整生命周期；由于插入过程本身会写热缓存，该结果不能称为严格冷缓存。
 
 ## 10. 结果报告模板
 
